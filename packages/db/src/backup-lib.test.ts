@@ -506,6 +506,74 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
   );
 
   it(
+    "preserves check and exclusion constraints across backup and restore",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_check_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-check-backup-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE SCHEMA "check_fixture";
+          CREATE TABLE "check_fixture"."tool_connections" (
+            "id" serial PRIMARY KEY,
+            "transport" text NOT NULL,
+            "slot" int4range NOT NULL,
+            CONSTRAINT "tool_connections_transport_check" CHECK ("transport" IN ('stdio', 'http')),
+            CONSTRAINT "tool_connections_slot_excl" EXCLUDE USING gist ("slot" WITH &&)
+          );
+          INSERT INTO "check_fixture"."tool_connections" ("transport", "slot")
+          VALUES ('stdio', int4range(1, 5));
+          ALTER TABLE "check_fixture"."tool_connections"
+            ADD CONSTRAINT "tool_connections_id_check" CHECK ("id" > 1) NOT VALID;
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-check-test",
+          backupEngine: "javascript",
+        });
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+        });
+
+        const constraints = await restoreSql.unsafe<{ conname: string; contype: string; convalidated: boolean }[]>(`
+          SELECT conname, contype::text AS contype, convalidated
+          FROM pg_constraint
+          WHERE conrelid = '"check_fixture"."tool_connections"'::regclass
+            AND contype IN ('c', 'x')
+          ORDER BY conname
+        `);
+        expect(constraints).toEqual([
+          { conname: "tool_connections_id_check", contype: "c", convalidated: false },
+          { conname: "tool_connections_slot_excl", contype: "x", convalidated: true },
+          { conname: "tool_connections_transport_check", contype: "c", convalidated: true },
+        ]);
+
+        await expect(
+          restoreSql.unsafe(`
+            INSERT INTO "check_fixture"."tool_connections" ("transport", "slot")
+            VALUES ('carrier-pigeon', int4range(10, 20))
+          `),
+        ).rejects.toThrow("tool_connections_transport_check");
+      } finally {
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    60_000,
+  );
+
+  it(
     "restores fallback COPY data when child tables are dumped before parent tables",
     async () => {
       const sourceConnectionString = await createTempDatabase();
