@@ -627,6 +627,7 @@ export function createHeartbeatScheduling(
     }
 
     try {
+      let quotaRetryExhausted = false;
       if (monitor?.serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME) {
         // Normalized monitor projections redact externalRef. Read the claimed
         // persisted policy only on this server-owned quota recovery path.
@@ -682,8 +683,10 @@ export function createHeartbeatScheduling(
           );
           if (scheduled.outcome === "not_scheduled")
             throw conflict(scheduled.reason);
+          quotaRetryExhausted = scheduled.outcome === "retry_exhausted";
         }
-      } else {
+      }
+      if (monitor?.serviceName !== PROVIDER_QUOTA_MONITOR_SERVICE_NAME || quotaRetryExhausted) {
         const wake = await enqueueWakeup(targetAgentId, {
           issueStateGuard: { statuses: [claimed.status], assigneeAgentId: claimed.assigneeAgentId,
             monitorNextCheckAt: scheduledAtIso, monitorWakeRequestedAt: claimed.monitorWakeRequestedAt!.toISOString() },

@@ -10,6 +10,19 @@ import { legacyExecutionNeedsReconciliation } from "../legacy-execution-recovery
 import { isConfigurationIncompleteFailedRun } from "../../modules/wake-queue/domain/values.js";
 
 describe("classifyAdapterFailureForRecovery", () => {
+  it("does not read the year of an ISO reset timestamp as a clock hour", () => {
+    const now = new Date("2026-10-13T15:30:00.000Z");
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota",
+      error: "Session limit is spent (the session reset at 2026-10-13T04:00:00.000Z).",
+      resultJson: {},
+    }, now)).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS),
+      parsedResetTime: false,
+    });
+  });
+
   it("waits for model configuration changes instead of retrying a typed native model rejection", () => {
     const run = { errorCode: "native_provider_model_rejected", error: "Fixed model configuration message", resultJson: null };
     expect(classifyAdapterFailureForRecovery(run)).toEqual({ kind: "configuration_incomplete" });
