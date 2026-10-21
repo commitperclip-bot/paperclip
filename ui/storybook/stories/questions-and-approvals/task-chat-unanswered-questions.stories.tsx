@@ -5,7 +5,17 @@ import { QuestionChat } from "../../fixtures/unansweredQuestionChat";
 const meta = {
   id: "chat-comments-task-chat-unanswered-questions",
   title: "Tasks and conversations/Questions and approvals/Chat & Comments/Task Chat Unanswered Questions",
-  parameters: { layout: "fullscreen" },
+  parameters: { layout: "fullscreen",
+    paperclip: {
+      "capabilities": [
+        "questions-and-approvals/dismiss-and-reopen",
+        "tasks/discussion"
+      ],
+      "implementation": "production",
+      "boundary": "fixtures",
+      "notes": "The filter uses one lowercase label without helper text. All chat-channel tasks count as bot-created; the focused visibility stories cover human-initiated channel work."
+    },
+  },
   component: QuestionChat,
   args: { conversationMode: false },
 } satisfies Meta<typeof QuestionChat>;

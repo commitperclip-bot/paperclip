@@ -88,6 +88,14 @@ Review: `baseline`.
 API: `present` — representative operation IDs:
 
 - `GET /api/health`.
+- `GET /api/liveness` and `HEAD /api/liveness` — public process startup status
+  and build commit only; no database readiness or workspace identity.
+
+Liveness is anonymous and runs before actor/session resolution. Hostname and
+signed-bootstrap endpoint validation still apply. It grants no instance control
+authority. [Liveness tests](../../server/src/__tests__/liveness.test.ts) cover idle
+drain, invalid ambient credentials, unavailable SQL, and startup recovery with
+local Express fixtures; no live provider or agent access is claimed.
 
 Agent access: `partial` — REST health plus local CLI doctor.
 

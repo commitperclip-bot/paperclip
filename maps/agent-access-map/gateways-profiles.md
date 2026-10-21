@@ -2,7 +2,9 @@
 
 Product map: [Tool gateways and access profiles](../feature-map/gateways-profiles.md).
 
-Review date: 2026-10-12. Source commit: `f981fa3cc10cb8663a87dec60345fbff46d54d0a`.
+Review date: 2026-10-12. Source commit: `58e16dbddfc9c8d0cf60867f9d9847f0feda055b`.
+Native REST transport reconciled in this change; see the
+[shared transport contract](README.md#native-rest-transport).
 
 This is a source-reviewed baseline of representative operations and known gaps.
 Each capability needs operation-level review before its entire scope can be
@@ -65,8 +67,8 @@ API: `present` — representative operation IDs:
 - `GET /api/tool-gateway/gateways/{gatewayId}/mcp`.
 - `POST /api/tool-gateway/sessions`.
 
-Agent access: `partial` — Existing scoped MCP client/session flow; assigned native app
-tools.
+Agent access: `partial` — Agent REST / native `call_api` for scoped session creation
+and revocation; existing MCP client protocol and assigned native app tools.
 
 Policy: Named gateway/profile administration and credentials are board tools:admin;
 agent sessions/tool use use separate scoped authority.
@@ -79,8 +81,16 @@ credentials/run context; inspect its result and applicable persistence/attributi
 Assert the relevant denied actor, owner, company or mode from Policy. Review the
 remaining operations before qualifying the whole capability.
 
-Gaps: Agent tool consumption exists. Copying/managing the endpoint and its client
-credentials remain management operations.
+Gaps: Scoped sessions remain agent/run-bound. MCP requires its existing protocol
+client; named gateways and gateway-token management retain board permissions.
+
+Discovery collapses identical descriptors with the same gateway name across
+providers, including native assigned-tool startup and fresh searches. Conflicting
+definitions remain an error. Distinct names and the normal invocation grants,
+approvals and revocation checks remain independent. Regression coverage lives in
+[gateway tests](../../server/src/__tests__/tool-gateway.test.ts) and
+[assigned-tool tests](../../server/src/services/native-runtime/assigned-mcp-tools.test.ts);
+these fixtures do not certify a live external-client journey.
 
 ## `tokens`
 
@@ -103,8 +113,9 @@ Verification: `not-run` — assert the documented agent denial with an owned tes
 verify any listed agent request/result path separately. A delegated operation needs its
 own policy and access review.
 
-Gaps: Native call_api blocks credential management; a grant to use an app does not
-create gateway-token authority.
+Gaps: Gateway-token management requires board tools:admin at the HTTP route.
+A grant to use an app does not create this authority; native `call_api` preserves
+the denial.
 
 ## `activity`
 

@@ -34,6 +34,7 @@ import {
 } from "./git-workspace-sync.js";
 import {
   captureDirectorySnapshot,
+  captureDirectorySnapshotOffThread,
   directorySnapshotSha256,
   classifyWorkspaceRestoreFailure,
   disposeDirectorySnapshot,
@@ -1173,6 +1174,7 @@ export async function prepareSandboxManagedRuntime(input: {
   syncWorkspace?: boolean;
   /** Selects authoritative host staging, exact durable-seed replay, or no-overwrite adoption. */
   workspaceInboundMode?: WorkspaceInboundMode;
+  workspaceSnapshotIsolation?: "worker";
   workspaceDurableSeed?: WorkspaceDurableSeedPaths;
   workspaceCheckpoint?: boolean;
   onWorkspaceCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
@@ -1205,6 +1207,9 @@ export async function prepareSandboxManagedRuntime(input: {
   /** Backoff before each automatic workspace copy-back retry. Tests shorten it. */
   workspaceRestoreRetryDelaysMs?: readonly number[];
 }): Promise<PreparedSandboxManagedRuntime> {
+  const captureWorkspaceSnapshot = input.workspaceSnapshotIsolation === "worker"
+    ? captureDirectorySnapshotOffThread
+    : captureDirectorySnapshot;
   const workspaceRemoteDir = input.workspaceRemoteDir ?? input.spec.remoteCwd;
   const runtimeRootDir = input.runtimeRootDir ?? path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
   if (input.runtimeRootDir !== undefined) {
@@ -1260,11 +1265,13 @@ export async function prepareSandboxManagedRuntime(input: {
   // span, because the teardown runs the restore inside that span.
   const runStepSpan = <T>(name: string, work: () => Promise<T>): Promise<T> =>
     input.runtimeSpan ? input.runtimeSpan(name, work) : work();
+  const reportWorkspaceStatus = (phase: RuntimeStatusPhase, message: string) =>
+    runStepSpan("workspace.progress", () => emitRuntimeStatus(input.onRuntimeProgress, phase, message));
 
   // Resolve an existing workspace alias once, before reading its snapshot.
   // All subsequent work uses that root, so retargeting the alias cannot select
   // another repository. Staging also verifies the captured directory identity.
-  const workspaceRoot = syncWorkspace ? await captureWorkspaceSourceRoot(input.workspaceLocalDir) : null;
+  const workspaceRoot = syncWorkspace ? await runStepSpan("workspace.source_root", () => captureWorkspaceSourceRoot(input.workspaceLocalDir)) : null;
   if (workspaceRoot) input = { ...input, workspaceLocalDir: workspaceRoot.sourceDir };
 
   // The git enumeration (`git status --ignored`, the HEAD diffs, `ls-files`).
@@ -1277,7 +1284,7 @@ export async function prepareSandboxManagedRuntime(input: {
           readGitWorkspaceSnapshot(input.workspaceLocalDir),
         )
     : null;
-  const repositories = gitSnapshot ? (gitSnapshot.repositories ?? []) : input.workspaceRepositories ?? (syncWorkspace ? await readManagedWorkspaceRepositories(input.workspaceLocalDir) : []);
+  const repositories = gitSnapshot ? (gitSnapshot.repositories ?? []) : input.workspaceRepositories ?? (syncWorkspace ? await runStepSpan("workspace.repositories", () => readManagedWorkspaceRepositories(input.workspaceLocalDir)) : []);
   const repositoryGitPaths = (children: typeof repositories, prefix = ""): string[] => children.flatMap(repo => {
     const relative = prefix ? `${prefix}/${repo.path}` : repo.path;
     return [`${relative}/.git`, ...repositoryGitPaths(repo.snapshot.repositories ?? [], relative)];
@@ -1310,7 +1317,7 @@ export async function prepareSandboxManagedRuntime(input: {
   // repository's ignore rules still govern which files may leave the host.
   // Use the same bounded, path-relative resolver as referenced project trees.
   const directoryIgnore = syncWorkspace && !gitSnapshot && input.workspaceFileMode !== "all"
-    ? await resolveReferencedSourceIgnore(input.workspaceLocalDir)
+    ? await runStepSpan("workspace.ignore_rules", () => resolveReferencedSourceIgnore(input.workspaceLocalDir))
     : null;
   if (directoryIgnore?.kind === "failed") {
     throw new Error(`Workspace ignore scan failed: ${directoryIgnore.reason}`);
@@ -1335,13 +1342,10 @@ export async function prepareSandboxManagedRuntime(input: {
   );
   const workspaceRestoreExclude = mergeExcludes(restoreExclude, repositories.map((repo) => repo.path));
   // The baseline "before" snapshot: a recursive walk of the whole workspace that
-  // `lstat`s every entry and SHA-256-hashes every file's bytes. This is the
-  // dominant cost in the pre-`pack` window — it reads the content of every
-  // non-excluded file, serially — so it earns its own span.
   baselineSnapshot = syncWorkspace
     ? (input.workspaceBaseline ??
       (await runStepSpan("snapshot.baseline", () =>
-        captureDirectorySnapshot(input.workspaceLocalDir, {
+        captureWorkspaceSnapshot(input.workspaceLocalDir, {
           exclude: restoreExclude,
           ignoredPaths,
           diskBacked: true,
@@ -1366,9 +1370,9 @@ export async function prepareSandboxManagedRuntime(input: {
   }
 
   const seedGeneration = input.workspaceSeedCacheDirectory && baselineSnapshot && workspaceInboundMode !== "durable_seed"
-    ? workspaceSeedGeneration(baselineSnapshot, gitSnapshot, repositories) : null;
+    ? await runStepSpan("workspace.seed_generation", async () => workspaceSeedGeneration(baselineSnapshot!, gitSnapshot, repositories)) : null;
   const cachedSeed = seedGeneration
-    ? await readWorkspaceSeedGeneration(input.workspaceSeedCacheDirectory!, seedGeneration) : null;
+    ? await runStepSpan("workspace.seed_lookup", () => readWorkspaceSeedGeneration(input.workspaceSeedCacheDirectory!, seedGeneration)) : null;
   const replaySeed = workspaceInboundMode === "durable_seed" ? input.workspaceDurableSeed : cachedSeed;
 
   // Every inbound staging step delegates to the provider through `client.syncIn`:
@@ -1465,7 +1469,7 @@ export async function prepareSandboxManagedRuntime(input: {
         params.progressLabel,
         { sink: input.onRuntimeProgress, phase: params.statusPhase },
       );
-      const syncResult = await syncIn(operations);
+      const syncResult = await runStepSpan("workspace.transfer", () => syncIn(operations));
       // Prefer the transport's own byte total. It is the real count for a
       // provider that has no host tarball to stat (a referenced project rides
       // a `directory` mapping). Fall back to the caller-supplied count when
@@ -1473,7 +1477,7 @@ export async function prepareSandboxManagedRuntime(input: {
       // shows the host-known workspace total.
       const transferredBytes = sumSyncResultBytes(syncResult);
       const reportedBytes = transferredBytes > 0 ? transferredBytes : params.progressBytes;
-      await upload.finish(reportedBytes, reportedBytes);
+      await runStepSpan("workspace.progress", () => upload.finish(reportedBytes, reportedBytes));
     };
 
     // Build the ordered inbound operation task list. Each task stages one inbound
@@ -1520,7 +1524,7 @@ export async function prepareSandboxManagedRuntime(input: {
             //    wipes the target tree EXCEPT `.paperclip-runtime`, so the overlay tar,
             //    which sits under `.paperclip-runtime`, survives to run its own extract.
             if (gitSnapshot || repositories.length) {
-              await emitRuntimeStatus(input.onRuntimeProgress, "git_sync", "Syncing git history to environment");
+              await reportWorkspaceStatus("git_sync", "Syncing git history to environment");
               const gitTarPath = path.join(tempDir, "git-workspace.tar");
               const remoteGitTar = path.posix.join(
                 runtimeRootDir,
@@ -1531,26 +1535,26 @@ export async function prepareSandboxManagedRuntime(input: {
                 if (!durableGitArchive) {
                   throw new Error("workspace_durable_seed_git_missing");
                 }
-                await copyDurableSeedArchive({
+                await runStepSpan("workspace.seed_replay", () => copyDurableSeedArchive({
                   sourcePath: durableGitArchive,
                   targetPath: gitTarPath,
                   expectedSha256: replaySeed.gitArchiveSha256,
-                });
+                }));
               } else {
-                const archive = async (cloneDir: string) => createTarballFromDirectory({ localDir: cloneDir, archivePath: gitTarPath, exclude: [".paperclip-runtime"] });
-                if (gitSnapshot) await withShallowGitWorkspaceClone({ localDir: input.workspaceLocalDir, snapshot: gitSnapshot }, archive);
-                else await withTempDir("paperclip-managed-repositories-", async (cloneDir) => {
+                const archive = async (cloneDir: string) => runStepSpan("workspace.git_archive", () => createTarballFromDirectory({ localDir: cloneDir, archivePath: gitTarPath, exclude: [".paperclip-runtime"] }));
+                if (gitSnapshot) await runStepSpan("workspace.git_clone", () => withShallowGitWorkspaceClone({ localDir: input.workspaceLocalDir, snapshot: gitSnapshot }, archive));
+                else await runStepSpan("workspace.git_clone", () => withTempDir("paperclip-managed-repositories-", async (cloneDir) => {
                   for (const repo of repositories) await withShallowGitWorkspaceClone({ localDir: path.join(input.workspaceLocalDir, repo.path), snapshot: repo.snapshot }, async (child) => copyCloneTree(child, path.join(cloneDir, repo.path)));
                   await archive(cloneDir);
-                });
+                }));
                 if (input.workspaceDurableSeed?.gitArchivePath) {
-                  await persistDurableSeedArchive({
+                  await runStepSpan("workspace.seed_persist", () => persistDurableSeedArchive({
                     sourcePath: gitTarPath,
-                    targetPath: input.workspaceDurableSeed.gitArchivePath,
-                  });
+                    targetPath: input.workspaceDurableSeed!.gitArchivePath!,
+                  }));
                 }
               }
-              if (cachedSeed && input.workspaceDurableSeed?.gitArchivePath) await persistDurableSeedArchive({ sourcePath: gitTarPath, targetPath: input.workspaceDurableSeed.gitArchivePath });
+              if (cachedSeed && input.workspaceDurableSeed?.gitArchivePath) await runStepSpan("workspace.seed_persist", () => persistDurableSeedArchive({ sourcePath: gitTarPath, targetPath: input.workspaceDurableSeed!.gitArchivePath! }));
               workspaceFiles.push({
                 sourcePath: gitTarPath,
                 targetPath: remoteGitTar,
@@ -1571,41 +1575,41 @@ export async function prepareSandboxManagedRuntime(input: {
             // 2. workspace-overlay tar. A git-backed overlay merges on top of the just
             //    extracted git tree (no wipe); a plain workspace wipes every child except
             //    the preserved names first. The extract runs AFTER the git extract.
-            await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing workspace to environment");
+            await reportWorkspaceStatus("config_sync", "Syncing workspace to environment");
             const workspaceTarPath = path.join(tempDir, "workspace.tar");
             if (replaySeed) {
-              await copyDurableSeedArchive({
+              await runStepSpan("workspace.seed_replay", () => copyDurableSeedArchive({
                 sourcePath: replaySeed.workspaceArchivePath,
                 targetPath: workspaceTarPath,
                 expectedSha256:
                   replaySeed.workspaceArchiveSha256,
-              });
+              }));
             } else {
               const workspaceArchiveDir = gitSnapshot || repositories.length
                 ? path.join(tempDir, "workspace-overlay")
                 : input.workspaceLocalDir;
               if (gitSnapshot || repositories.length) {
-                await copySelectedWorkspaceEntries({
+                await runStepSpan("workspace.overlay_copy", () => copySelectedWorkspaceEntries({
                   sourceRoot: workspaceRoot!,
                   targetDir: workspaceArchiveDir,
                   relativePaths: (input.workspaceFileMode === "all" ? undefined : gitSnapshot?.overlayPaths) ?? (baselineSnapshot!.entries instanceof WorkspaceManifestMap ? baselineSnapshot!.entries.manifest : [...baselineSnapshot!.entries.keys()]),
                   ignoredPaths,
                   exclude: workspaceArchiveExclude,
-                });
+                }));
               }
-              await createTarballFromDirectory({
+              await runStepSpan("workspace.overlay_archive", () => createTarballFromDirectory({
                 localDir: workspaceArchiveDir,
                 archivePath: workspaceTarPath,
                 exclude: gitSnapshot || repositories.length ? undefined : workspaceArchiveExclude,
-              });
+              }));
               if (input.workspaceDurableSeed) {
-                await persistDurableSeedArchive({
+                await runStepSpan("workspace.seed_persist", () => persistDurableSeedArchive({
                   sourcePath: workspaceTarPath,
-                  targetPath: input.workspaceDurableSeed.workspaceArchivePath,
-                });
+                  targetPath: input.workspaceDurableSeed!.workspaceArchivePath,
+                }));
               }
             }
-            if (cachedSeed && input.workspaceDurableSeed) await persistDurableSeedArchive({ sourcePath: workspaceTarPath, targetPath: input.workspaceDurableSeed.workspaceArchivePath });
+            if (cachedSeed && input.workspaceDurableSeed) await runStepSpan("workspace.seed_persist", () => persistDurableSeedArchive({ sourcePath: workspaceTarPath, targetPath: input.workspaceDurableSeed!.workspaceArchivePath }));
             const remoteWorkspaceTar = path.posix.join(
               runtimeRootDir,
               "workspace-upload.tar",
@@ -1629,7 +1633,7 @@ export async function prepareSandboxManagedRuntime(input: {
             if ((isPathManifest(deletedPaths) ? deletedPaths.count : deletedPaths.length) > 0) {
               const deletedManifest = path.join(tempDir, "deleted.nul");
               const remoteDeletedManifest = path.posix.join(runtimeRootDir, "deleted.nul");
-              await writeWorkspacePaths(deletedPaths, deletedManifest);
+              await runStepSpan("workspace.deleted_manifest", () => writeWorkspacePaths(deletedPaths, deletedManifest));
               workspaceFiles.push({ sourcePath: deletedManifest, targetPath: remoteDeletedManifest, kind: "file", access: "rw", writablePath: runtimeRootDir });
               workspacePostUploadCommands.push({ command: buildRemoveDeletedPathsCommand({ remoteDir: workspaceRemoteDir, manifestPath: remoteDeletedManifest }) });
             }
@@ -1638,14 +1642,14 @@ export async function prepareSandboxManagedRuntime(input: {
 
           if (seedGeneration && !cachedSeed && input.workspaceDurableSeed) {
             const seed = input.workspaceDurableSeed;
-            await publishWorkspaceSeedGeneration(input.workspaceSeedCacheDirectory!, seedGeneration,
+            await runStepSpan("workspace.seed_publish", () => publishWorkspaceSeedGeneration(input.workspaceSeedCacheDirectory!, seedGeneration,
               { ...seed, gitArchivePath: gitSnapshot || repositories.length ? seed.gitArchivePath : null }, {
                 companyDirectory: input.workspaceSeedCacheCompanyDirectory,
                 verify: () => runStepSpan("seed.verify", async () => {
                   const verifiedRoot = path.join(tempDir, "verify-seed");
                   try {
-                    if (gitSnapshot || repositories.length) await extractTarballToDirectory({ archivePath: path.join(tempDir, "git-workspace.tar"), localDir: verifiedRoot });
-                    await extractTarballToDirectory({ archivePath: path.join(tempDir, "workspace.tar"), localDir: verifiedRoot, exclude: repositoryMetadataExcludes });
+                    if (gitSnapshot || repositories.length) await runStepSpan("workspace.seed_extract", () => extractTarballToDirectory({ archivePath: path.join(tempDir, "git-workspace.tar"), localDir: verifiedRoot }));
+                    await runStepSpan("workspace.seed_extract", () => extractTarballToDirectory({ archivePath: path.join(tempDir, "workspace.tar"), localDir: verifiedRoot, exclude: repositoryMetadataExcludes }));
                     for (const relative of workspacePaths(deletedPaths)) {
                       let parent = verifiedRoot;
                       for (const segment of relative.split("/").slice(0, -1)) {
@@ -1655,12 +1659,12 @@ export async function prepareSandboxManagedRuntime(input: {
                       }
                       await fs.rm(path.join(verifiedRoot, relative), { recursive: true, force: true });
                     }
-                    const verified = await captureDirectorySnapshot(verifiedRoot, { exclude: baselineSnapshot!.exclude, ignoredPaths: baselineSnapshot!.ignoredPaths, diskBacked: true });
+                    const verified = await runStepSpan("workspace.seed_snapshot", () => captureWorkspaceSnapshot(verifiedRoot, { exclude: baselineSnapshot!.exclude, ignoredPaths: baselineSnapshot!.ignoredPaths, diskBacked: true }));
                     try { return directorySnapshotSha256(verified) === directorySnapshotSha256(baselineSnapshot!); }
                     finally { await disposeDirectorySnapshot(verified); }
-                  } finally { await fs.rm(verifiedRoot, { recursive: true, force: true }); }
+                  } finally { await runStepSpan("workspace.seed_cleanup", () => fs.rm(verifiedRoot, { recursive: true, force: true })); }
                 }),
-              });
+              }));
           }
           if (!stageWorkspace) return;
 
@@ -1819,11 +1823,11 @@ export async function prepareSandboxManagedRuntime(input: {
     // tasks under the client's concurrency permission and the bound, and it
     // settles every started task before it returns. This is the startup barrier:
     // the coordinator returns only after every upload settles.
-    const inboundResults = await scheduleSyncOperations(
+    const inboundResults = await runStepSpan("workspace.inbound_barrier", () => scheduleSyncOperations(
       inboundTasks,
       input.client.allowConcurrentSyncOperations === true,
       SYNC_OPERATION_CONCURRENCY_LIMIT,
-    );
+    ));
 
     // Collect the referenced-project failures in stable input order.
     for (const failure of additionalFailureSlots) {
@@ -1908,6 +1912,7 @@ export async function prepareSandboxManagedRuntime(input: {
                 adapterKey: input.adapterKey,
                 workspaceLocalDir: localDir,
                 workspaceInboundMode: "adopt_remote",
+                workspaceSnapshotIsolation: input.workspaceSnapshotIsolation,
                 workspaceCheckpoint: input.workspaceCheckpoint,
                 onWorkspaceCheckpoint: input.onWorkspaceCheckpoint,
                 workspaceGitSnapshot: repository.snapshot,
@@ -2144,6 +2149,7 @@ export async function prepareSandboxManagedRuntime(input: {
                   });
                   try {
                     await mergeDirectoryWithBaseline({
+                      workspaceSnapshotIsolation: input.workspaceSnapshotIsolation,
                       baseline: mergeBaseline,
                       sourceDir: extractedDir,
                       ...(checkpointSnapshot ? { snapshots: { source: checkpointSnapshot } } : {}),

@@ -50,6 +50,14 @@ const meta = {
   parameters: {
     layout: "fullscreen",
     docs: { description: { component: "Controlled output in the production thread and composer. At the bottom, updates stay visible. Scroll up to hold your reading position, then return to the bottom to resume following. Stop pauses the fixture; send a message to resume. No agent or provider calls." } },
+    paperclip: {
+      "capabilities": [
+        "tasks/discussion"
+      ],
+      "implementation": "production",
+      "boundary": "fixtures",
+      "notes": "The filter uses one lowercase label without helper text. All chat-channel tasks count as bot-created; the focused visibility stories cover human-initiated channel work."
+    },
   },
   globals: { theme: "light", viewport: { value: "mobile", isRotated: false } },
 } satisfies Meta<typeof MobileFollow>;

@@ -691,6 +691,33 @@ exec "$PROBE_REAL_GIT" "$@"
     await expect(f.service.prepareForAdmission(f.admission)).resolves.toEqual([]);
   });
 
+  it("rechecks retargeted execution-workspace aliases at admission and publication", async () => {
+    const f = await fixture(), peer = await standardPeer(f);
+    const unrelated = path.join(root, `${f.issueId}-unrelated`); await mkdir(unrelated);
+    const alias = path.join(root, `${f.issueId}-alias`); await symlink(unrelated, alias);
+    await db.update(executionWorkspaces).set({ cwd: alias }).where(eq(executionWorkspaces.id, peer.workspace.id));
+    await db.update(issues).set({ visibility: "private", privacyRootIssueId: peer.issueId, responsibleUserId: peer.userId })
+      .where(eq(issues.id, peer.issueId));
+    await expect(f.service.prepareForAdmission(f.admission)).resolves.toEqual([]);
+    await rm(alias);
+    await symlink(f.admission.cwd, alias);
+    await expect(assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: f.admission.cwd, actor: f.actor }))
+      .rejects.toThrow();
+    await expect(f.service.prepareForAdmission(f.admission)).rejects.toThrow();
+    await expect(f.service.guardForPublication(f.admission)).rejects.toThrow();
+  });
+
+  it.each(["conflicting_path", "overlapping_invalid_key"] as const)("rejects retained root identity corruption (%s)", async scenario => {
+    const f = await fixture();
+    const canonicalCwd = await realpath(f.admission.cwd);
+    const unrelated = path.join(root, `${f.issueId}-unrelated`); await mkdir(unrelated);
+    await db.insert(executionWorkspaceRepositoryAccess).values({ companyId: f.companyId, kind: "source", scopeId: f.workspace.id,
+      rootKey: createHash("sha256").update(scenario === "conflicting_path" ? canonicalCwd : await realpath(unrelated)).digest("hex"),
+      canonicalCwd: scenario === "conflicting_path" ? await realpath(unrelated) : path.join(canonicalCwd, "child") });
+    await expect(f.service.prepareForAdmission(f.admission)).rejects.toThrow("Repository root identity conflicts");
+    await expect(f.service.guardForPublication(f.admission)).rejects.toThrow("Repository root identity conflicts");
+  });
+
   it.each(["revoked", "deleted_source", "deleted_owner", "retained_reader"] as const)("protects already-copied bytes when post-copy authorization fails (%s)", async failure => {
     const f = await fixture(), exec = promisify(execFileCallback);
     await exec("git", ["init", "--initial-branch=main", f.admission.cwd]);

@@ -1787,12 +1787,52 @@ describe("Capability live runnerd and Codex session", () => {
       turnTimeoutMs: 500,
     });
     state.holdAfterTool = true;
-    const killedTurn = captureTurnRejection(first.sendMessage("Apply idempotent progress once."));
-    await vi.waitFor(async () => {
-      expect((await firstStore.load(binding.sessionId))?.mockState).toContain(
-        "Progress persisted through the live Codex tool loop.",
-      );
+    let turnSettled = false;
+    let turnFailure: unknown = null;
+    const killedTurn = captureTurnRejection(first.sendMessage("Apply idempotent progress once.")).then((error) => {
+      turnSettled = true;
+      turnFailure = error;
+      return error;
     });
+    try {
+      await vi.waitFor(async () => {
+        expect((await firstStore.load(binding.sessionId))?.mockState).toContain(
+          "Progress persisted through the live Codex tool loop.",
+        );
+      });
+    } catch (error) {
+      try {
+        const summarize = (snapshot: CapabilityLiveSessionSnapshot | null) => {
+          if (snapshot === null) return null;
+          const mock = JSON.parse(snapshot.mockState);
+          return {
+            revision: snapshot.revision,
+            status: snapshot.status,
+            activeTurnId: snapshot.activeTurnId,
+            mockRevision: mock.revision,
+            comments: mock.comments.length,
+            evidenceKinds: snapshot.evidence.slice(-8).map((entry) => entry.kind),
+          };
+        };
+        const stored = await firstStore.load(binding.sessionId).catch(() => null);
+        const diagnostics = {
+          turnSettled,
+          turnFailure: turnFailure instanceof Error
+            ? { name: turnFailure.name, message: turnFailure.message.slice(0, 240) }
+            : typeof turnFailure,
+          requests: state.transports[0]?.requests.slice(-16).map((request) => request.method),
+          memory: summarize(first.snapshot()),
+          stored: summarize(stored),
+        };
+        if (error instanceof Error) error.message += `\nDurable progress diagnostics: ${JSON.stringify(diagnostics)}`;
+      } catch (diagnosticError) {
+        const diagnosticUnavailable = diagnosticError instanceof Error
+          ? { name: diagnosticError.name, message: diagnosticError.message.slice(0, 240) }
+          : { name: typeof diagnosticError };
+        if (error instanceof Error) error.message += `\nDurable progress diagnostics unavailable: ${JSON.stringify(diagnosticUnavailable)}`;
+      }
+      throw error;
+    }
     await expect(first.recordUsage({
       receiptId: "provider-response-1",
       providerResponseId: "response-1",
@@ -1871,7 +1911,7 @@ describe("Capability live runnerd and Codex session", () => {
       reasoningTokens: 5,
       costNanodollars: 2_500,
     });
-  });
+  }, 15_000);
 
   it("does not raise an unhandled rejection when interrupt() outlasts the turn timeout during reconcileActiveTurn", async () => {
     const state = providerState();

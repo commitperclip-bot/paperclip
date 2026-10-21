@@ -31,7 +31,7 @@ describe("Honeycomb run links", () => {
     expect(query.filter_combination).toBe("AND");
     expect(query.filters).toEqual([
       { column: "service.name", op: "=", value: "paperclip" },
-      { column: "name", op: "in", value: ["task.run", "task.provider_session"] },
+      { column: "name", op: "in", value: ["task.run", "task.provider_session", "task.execution_attempt"] },
       {
         column: HONEYCOMB_RUN_HASH_ATTRIBUTE,
         op: "=",

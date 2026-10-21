@@ -1,3 +1,7 @@
+---
+navigation: {"section":"Tasks and conversations","sectionOrder":20,"order":40}
+---
+
 # Agent conversations and project handoff
 
 A person can hold a persistent conversation with an agent, return to its history, and hand useful work into a project or task. The gated conference-room chat is a separate conversation surface.
@@ -61,3 +65,12 @@ Manual: Check disabled access first, enable in the disposable instance, then sen
 - Idle chat is not failed execution.
 - See [steering](./steering.md) for in-flight messages and [questions](./questions-and-approvals.md) for interactions.
 - An API tool test does not prove that every harness will choose the same handoff tool.
+
+### Storybook verification
+
+#### `conference-room`
+
+Scope: ui
+Storybook: Conference-room flag disabled, empty/history/reply, busy and explicit failure states.
+Production: Exercise separate BoardChat route gate, local-trusted deployment and authenticated Claude CLI; send/reload real conversation with responding agent attribution.
+Sources: Source: [BoardChat.tsx](../../ui/src/pages/BoardChat.tsx), [board-chat.ts](../../server/src/routes/board-chat.ts). Tests: [BoardChat.test.tsx](../../ui/src/pages/BoardChat.test.tsx), [board-chat-route-feature-flag.test.ts](../../server/src/__tests__/board-chat-route-feature-flag.test.ts)

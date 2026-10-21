@@ -111,3 +111,12 @@ remaining operations before qualifying the whole capability.
 
 Gaps: Description/goal/target selection exist; host workspace command mutation is denied
 to agents and budget policy is board-managed.
+
+Repository attachment also writes a durable skill import binding in its transaction.
+Agent-created bindings derive their refresh person from authenticated responsible-user
+context. Project selection does not grant runtime credentials or override private
+project skill access. Verify automatic import and denial with the actual agent identity.
+
+Workspace creation, update and deletion require project:write_workspace through
+the shared authorization evaluator in addition to project read access. Repository
+attachment does not bypass skill-import policy for its background discovery.

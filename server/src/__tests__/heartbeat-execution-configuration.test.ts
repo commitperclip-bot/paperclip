@@ -1,9 +1,18 @@
-import { randomUUID } from "node:crypto";
-import { access, readFile } from "node:fs/promises";
+import { enableRunFailureReporting } from "./helpers/run-failure-reporting.js";
+import { createHash, randomUUID } from "node:crypto";
+import { trace } from "@opentelemetry/api";
+import { InMemorySpanExporter, SimpleSpanProcessor, TracerProvider } from "@opentelemetry/sdk-trace";
+import { access, readFile, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, companyMemberships, createDb, heartbeatRunEvents, heartbeatRuns, issues, projects } from "@paperclipai/db";
+import { agents, companies, companyMemberships, companySkills, createDb, heartbeatRunEvents, heartbeatRuns, issues, projects } from "@paperclipai/db";
+import { companySkillService } from "../services/company-skills.js";
+import { secretService } from "../services/secrets.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
+import { withSkillVersionCacheLock } from "../services/skill-version-cache.js";
+import { prepareHeartbeatExecutionConfiguration } from "../services/heartbeat/execution-configuration.js";
 import { registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
 import { HttpError } from "../errors.js";
 import { heartbeatService } from "../services/heartbeat.js";
@@ -37,10 +46,14 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
   const captured = new Map<string, AdapterExecutionContext>();
   const inspect = new Map<string, (input: AdapterExecutionContext) => Promise<void>>();
   const adapterType = "codex_local";
+  const oldHome = process.env.PAPERCLIP_HOME;
+  let home: string;
 
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("heartbeat-execution-config-");
     db = createDb(temporary.connectionString);
+    home = await mkdtemp(path.join(tmpdir(), "paperclip-execution-skills-"));
+    process.env.PAPERCLIP_HOME = home;
     heartbeat = heartbeatService(db);
     // Exercise real preparation for a managed-capable adapter without calling a provider.
     registerServerAdapter({
@@ -54,12 +67,14 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
       testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }),
     });
   }, 30_000);
-  afterEach(() => { vi.restoreAllMocks(); skillFailures.clear(); });
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); skillFailures.clear(); });
   afterAll(async () => {
     await heartbeat?.drainActiveRunExecutions();
     unregisterServerAdapter(adapterType);
     await db?.$client.end({ timeout: 0 });
     await temporary?.cleanup();
+    if (oldHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = oldHome;
+    if (home) await rm(home, { recursive: true, force: true });
   });
 
   async function seed(managed = false) {
@@ -92,6 +107,75 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     return { finished, input: captured.get(run!.id) };
   }
 
+  async function configuration(f: Awaited<ReturnType<typeof seed>>, config: Record<string, unknown>, snapshot: Record<string, unknown> = {}, type = "paperclip_runner") {
+    const [agent] = await db.update(agents).set({ adapterType: type, adapterConfig: config }).where(eq(agents.id, f.agentId)).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, scopeKind: "issue", status: "running", contextSnapshot: snapshot }).returning();
+    const resolvedInstanceSettings = await instanceSettingsService(db).get();
+    return { run, prepare: () => prepareHeartbeatExecutionConfiguration(db, {
+      run, agent,
+      task: { issueId: f.issueId, context: { ...snapshot, issueId: f.issueId }, responsibleUserId: null,
+        acceptedPlanContinuationWake: false, acceptedPlanWakeRoutingDecision: null,
+        taskProjectContext: null, routineEnvContext: { routineId: null, env: null, responsibleUserId: null } },
+      config: { sourceWorkspaceConfig: config, aiBinding: undefined },
+      policy: { trustPreset: { kind: "standard", preset: "standard", boundary: null, sourcePresets: {} }, useIsolatedTaskDirectory: false, explicitTaskDirectory: false },
+      environment: { selectedEnvironmentId: null, selectedEnvironmentForConfig: null,
+        resolvedInstanceSettings, persistedNativeExecutionInput: null },
+      services: { secretsSvc: secretService(db), companySkills: companySkillService(db), appendRunEvent: vi.fn(), finalizeAiConnectionBusyDeferral: vi.fn() },
+      onFailureSecretsResolved: () => {}, onManagedAiRuntimeAcquired: () => {}, onIdentityRedactorPrepared: () => {},
+    }) };
+  }
+
+  it.each(["fresh", "saved empty"])("prepares a %s native skill selection while another run holds the company cache lock", async kind => {
+    const f = await seed();
+    const selected = kind === "saved empty" ? await companySkillService(db).createLocalSkill(f.companyId, { name: "Later assignment" }) : null;
+    const input = await configuration(f, selected ? { paperclipSkillSync: { desiredSkills: [selected.key] } } : {},
+      kind === "saved empty" ? { skillVersions: {}, skillSelectionSnapshot: true } : {});
+    let release!: () => void;
+    let acquired!: () => void;
+    const ready = new Promise<void>(resolve => { acquired = resolve; });
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const holder = withSkillVersionCacheLock(db, f.companyId, async () => { acquired(); await barrier; });
+    await ready;
+    const started = performance.now();
+    const pending = input.prepare();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([pending, new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), 2000); })]);
+      expect(result, "An empty native selection must not queue behind skill hydration").not.toBeNull();
+      console.info("Empty-skill preparation under a held cache lock", { kind, elapsedMs: performance.now() - started });
+      expect(result?.prepared).toBe(true);
+      if (result?.prepared) expect(result.runtimeSkillEntries).toEqual([]);
+      const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.run.id));
+      expect(saved.contextSnapshot).toMatchObject({ skillVersions: {}, skillSelectionSnapshot: true });
+    } finally {
+      if (timer) clearTimeout(timer);
+      release();
+      await holder;
+      await pending;
+    }
+  });
+
+  it.each(["selected native", "legacy operational"])("retains the cache exclusion for %s skills", async kind => {
+    const f = await seed();
+    const selected = await companySkillService(db).createLocalSkill(f.companyId, { name: "Selected lock control" });
+    const input = await configuration(f, { paperclipSkillSync: { desiredSkills: kind === "selected native" ? [selected.key] : [] } }, {}, kind === "selected native" ? "paperclip_runner" : "codex_local");
+    let release!: () => void;
+    let acquired!: () => void;
+    const ready = new Promise<void>(resolve => { acquired = resolve; });
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const holder = withSkillVersionCacheLock(db, f.companyId, async () => { acquired(); await barrier; });
+    await ready;
+    let settled = false;
+    const pending = input.prepare().finally(() => { settled = true; });
+    try {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(settled).toBe(false);
+    } finally { release(); await holder; }
+    const result = await pending;
+    expect(result.prepared).toBe(true);
+    if (result.prepared) expect(result.runtimeSkillEntries.some(entry => entry.key === (kind === "selected native" ? selected.key : "paperclipai/paperclip/paperclip"))).toBe(true);
+  });
+
   it("applies project environment and issue overrides and replaces caller-supplied runtime fields", async () => {
     const f = await seed();
     const { finished, input } = await execute(f);
@@ -102,6 +186,7 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
   });
 
   it("delivers the selected credential in an isolated home and removes it after completion", async () => {
+    vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.test");
     const f = await seed(true);
     let providerHome: string | undefined;
     inspect.set(f.agentId, async input => {
@@ -112,17 +197,40 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
       expect(JSON.parse(await readFile(path.join(providerHome, "auth.json"), "utf8"))).toEqual({ OPENAI_API_KEY: f.credential });
       await input.onMeta?.({ adapterType, command: "fixture", env, prompt: "fixture" });
     });
-    const { finished, input } = await execute(f);
-    expect(finished.status, finished.error ?? undefined).toBe("succeeded");
-    expect(input?.context.aiConnection).toMatchObject({ accountName: "Fixture account", provider: "openai" });
-    expect(providerHome).toEqual(expect.any(String));
-    await expect(access(providerHome!)).rejects.toMatchObject({ code: "ENOENT" });
-    const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, finished.id));
-    expect(events.some(event => event.eventType === "adapter.invoke")).toBe(true);
-    expect(JSON.stringify(events)).not.toContain(f.credential);
+    const exporter = new InMemorySpanExporter();
+    const provider = new TracerProvider({ spanProcessors: [new SimpleSpanProcessor({ exporter })] });
+    expect(trace.setGlobalTracerProvider(provider)).toBe(true);
+    try {
+      const { finished, input } = await execute(f);
+      expect(finished.status, finished.error ?? undefined).toBe("succeeded");
+      expect(input?.context.aiConnection).toMatchObject({ accountName: "Fixture account", provider: "openai" });
+      expect(providerHome).toEqual(expect.any(String));
+      await expect(access(providerHome!)).rejects.toMatchObject({ code: "ENOENT" });
+      const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, finished.id));
+      expect(events.some(event => event.eventType === "adapter.invoke")).toBe(true);
+      expect(JSON.stringify(events)).not.toContain(f.credential);
+      await provider.forceFlush();
+      const runIdHash = createHash("sha256").update(finished.id).digest("hex").slice(0, 12);
+      const steps = exporter.getFinishedSpans().filter(span => span.name.startsWith("heartbeat.prepare.configuration_")
+        && span.attributes["paperclip.task.run.run_id"] === runIdHash);
+      expect(steps.map(span => span.name)).toEqual([
+        "configuration_mentions", "configuration_github_identity", "configuration_secrets", "configuration_ai_runtime",
+        "configuration_skills", "configuration_connector_assignments", "configuration_connector_skills",
+        "configuration_connector_delivery", "configuration_connection_instructions", "configuration_agent_identity",
+      ].map(step => `heartbeat.prepare.${step}`));
+      for (const span of steps) {
+        expect(span.status).toEqual({ code: 0 });
+        expect(span.attributes).toEqual({ "paperclip.task.run.run_id": runIdHash });
+        expect(span.events).toEqual([]);
+      }
+    } finally {
+      trace.disable();
+      await provider.shutdown();
+    }
   });
 
   it("cleans acquired credentials and redacts diagnostics when later skill preparation fails", async () => {
+    vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.test");
     const f = await seed(true);
     skillFailures.set(f.companyId, `Invalid fixture skill configuration: ${f.credential}`);
     const capturedFailure = vi.spyOn(sentry, "captureRunFailure").mockImplementation(() => undefined);
@@ -134,18 +242,36 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
       await access(acquiredHome!);
       return runtime;
     });
-    const { finished, input } = await execute(f);
-    expect(finished.status).toBe("failed");
-    expect(input).toBeUndefined();
-    expect(acquiredHome).toEqual(expect.any(String));
-    await expect(access(acquiredHome!)).rejects.toMatchObject({ code: "ENOENT" });
-    expect(finished.error).toContain("Invalid fixture skill configuration");
-    // The diagnostic reporter redacts runtime values before the external sink.
-    // The legacy local run.error field does not apply this value-based redaction.
-    await waitForPendingRunFailureReports();
-    expect(capturedFailure).toHaveBeenCalled();
-    expect(JSON.stringify(capturedFailure.mock.calls)).toContain("Invalid fixture skill configuration");
-    expect(JSON.stringify(capturedFailure.mock.calls)).not.toContain(f.credential);
+    const exporter = new InMemorySpanExporter();
+    const provider = new TracerProvider({ spanProcessors: [new SimpleSpanProcessor({ exporter })] });
+    expect(trace.setGlobalTracerProvider(provider)).toBe(true);
+    try {
+      const { finished, input } = await execute(f);
+      expect(finished.status).toBe("failed");
+      expect(input).toBeUndefined();
+      expect(acquiredHome).toEqual(expect.any(String));
+      await expect(access(acquiredHome!)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(finished.error).toContain("Invalid fixture skill configuration");
+      await waitForPendingRunFailureReports();
+      expect(capturedFailure).toHaveBeenCalled();
+      expect(JSON.stringify(capturedFailure.mock.calls)).toContain("Invalid fixture skill configuration");
+      expect(JSON.stringify(capturedFailure.mock.calls)).not.toContain(f.credential);
+      await provider.forceFlush();
+      const runIdHash = createHash("sha256").update(finished.id).digest("hex").slice(0, 12);
+      const steps = exporter.getFinishedSpans().filter(span => span.name.startsWith("heartbeat.prepare.configuration_")
+        && span.attributes["paperclip.task.run.run_id"] === runIdHash);
+      expect(steps.find(span => span.name === "heartbeat.prepare.configuration_ai_runtime")?.status.code).toBe(0);
+      expect(steps.find(span => span.name === "heartbeat.prepare.configuration_skills")?.status).toEqual({ code: 2 });
+      expect(steps.some(span => span.name === "heartbeat.prepare.configuration_connector_assignments")).toBe(false);
+      for (const span of steps) {
+        expect(span.attributes).toEqual({ "paperclip.task.run.run_id": runIdHash });
+        expect(span.events).toEqual([]);
+      }
+      expect(JSON.stringify(steps.map(span => ({ name: span.name, status: span.status, attributes: span.attributes, events: span.events })))).not.toContain(f.credential);
+    } finally {
+      trace.disable();
+      await provider.shutdown();
+    }
   });
 
   it("defers a busy account without dispatch and preserves its scheduled retry", async () => {
@@ -157,4 +283,40 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
     expect(runs.filter(run => run.id !== finished.id)).toEqual([expect.objectContaining({ status: "scheduled_retry", scheduledRetryReason: "ai_connection_busy" })]);
   });
+
+  it("snapshots only selected immutable skills and omits inaccessible optional assignments", async () => {
+    const f = await seed();
+    const skills = companySkillService(db);
+    const selected = await skills.createLocalSkill(f.companyId, { name: "Selected workflow", markdown: "# Selected\nUse the original workflow.\n" });
+    const unused = await skills.createLocalSkill(f.companyId, { name: "Unused workflow" });
+    const restricted = await skills.createLocalSkill(f.companyId, { name: "Restricted workflow" });
+    await db.update(companySkills).set({ accessSourceId: randomUUID() }).where(eq(companySkills.id, restricted.id));
+    await db.update(agents).set({ adapterConfig: { paperclipSkillSync: { desiredSkills: [restricted.key] } } }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ description: "Use [/selected](skill://" + selected.id + "?s=selected-workflow)." }).where(eq(issues.id, f.issueId));
+    const { finished, input } = await execute(f);
+    expect(finished.status, finished.error ?? undefined).toBe("succeeded");
+    const inventory = input?.config.paperclipRuntimeSkills as Array<{ key: string; source: string; versionId: string }>;
+    expect(inventory.some(entry => entry.key === unused.key || entry.key === restricted.key)).toBe(false);
+    const delivered = inventory.find(entry => entry.key === selected.key)!;
+    expect(delivered.versionId).toBe(selected.currentVersionId);
+    expect(delivered.source).toContain(selected.currentVersionId!);
+    expect(await readFile(path.join(delivered.source, "SKILL.md"), "utf8")).toContain("Use the original workflow.");
+    expect(finished.contextSnapshot).toMatchObject({ skillSelectionSnapshot: true, skillVersions: { [selected.key]: selected.currentVersionId } });
+    expect(Object.keys(finished.contextSnapshot!.skillVersions as object)).not.toContain(unused.key);
+    expect(Object.keys(finished.contextSnapshot!.skillVersions as object)).not.toContain(restricted.key);
+  });
+
+  it("rejects an inaccessible explicit skill reference before adapter dispatch", async () => {
+    const f = await seed();
+    const skill = await companySkillService(db).createLocalSkill(f.companyId, { name: "Private reference" });
+    await db.update(companySkills).set({ accessSourceId: randomUUID() }).where(eq(companySkills.id, skill.id));
+    await db.update(issues).set({ description: "Use [/private](skill://" + skill.id + "?s=private-reference)." }).where(eq(issues.id, f.issueId));
+    const { finished, input } = await execute(f);
+    expect(finished.status).toBe("failed");
+    expect(finished.error).toContain("referenced skill is unavailable");
+    expect(input).toBeUndefined();
+  });
 });
+
+
+enableRunFailureReporting();

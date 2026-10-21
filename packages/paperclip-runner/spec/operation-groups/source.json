@@ -8,6 +8,7 @@
     "sandbox": "Sandbox resource measurements.",
     "workspace": "Workspace readiness.",
     "harness": "Provider harness startup, readiness, exit, and diagnostics.",
+    "auth": "Content-free harness credential changes observed by the runner.",
     "session": "Provider-neutral session open, resume, reconciliation, close, and failure.",
     "turn": "Model turn submission through terminal turn disposition.",
     "item": "Provider-neutral model/tool item lifecycle.",

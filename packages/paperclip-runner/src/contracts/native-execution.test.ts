@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { QUALIFIED_ACPX_PROFILES } from "../drivers/acpx/qualified-profiles.js";
 import { describe, expect, it } from "vitest";
@@ -405,6 +406,16 @@ describe("NativeExecutionInputV1", () => {
       session: { ...input.session, driverKind: "opencode_server" },
       provider,
     })).toThrow("does not match");
+  });
+
+  it("decodes saved Copilot v17 input after the current source declaration advances", () => {
+    const historical = JSON.parse(readFileSync(new URL("../../test/fixtures/copilot-profile-v17-identity.json", import.meta.url), "utf8"));
+    const { permissionPolicy, qualificationStatus: _status, ...currentProfile } = QUALIFIED_ACPX_PROFILES.copilot;
+    const provider = { kind: "acpx", agent: "copilot", model: "explicit-provider-model", permissionPolicy,
+      profile: { ...currentProfile, agentProfileVersion: 17, commandDigest: historical.commandDigest } };
+    const parsed = parseNativeExecutionInput({ ...input, session: { ...input.session, driverKind: "acpx_runtime" }, provider });
+    expect(parsed.provider).toEqual(provider);
+    expect(parseNativeExecutionInput(parsed)).toEqual(parsed);
   });
 
   it.each(Object.values(QUALIFIED_ACPX_PROFILES))(

@@ -4,6 +4,7 @@ import {
   agents, agentSessionGoalActions, agentTaskSessions, companies, createDb,
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues,
 } from "@paperclipai/db";
+import { PROVIDER_QUOTA_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -11,6 +12,8 @@ import { conflict } from "../../errors.js";
 import { createHeartbeatRunPreparation } from "./run-preparation.js";
 import { createHeartbeatRunState } from "./run-state.js";
 import { createHeartbeatScheduling, type HeartbeatSchedulingDependencies } from "./scheduling.js";
+import { readIdleSleepSafety } from "../idle-sleep-safety.js";
+import { CONVERSATION_CONTINUATION_POLICY } from "../conversation-continuation.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 
@@ -134,6 +137,28 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
     expect(await readIssue(f.issue.id)).toMatchObject({ monitorNextCheckAt: null, monitorAttemptCount: 1 });
   });
 
+  it("restores the reported future deadline and claims monitor delivery exactly once", async () => {
+    const f = await fixture();
+    const at = new Date(now.getTime() + 600_000);
+    await db.update(issues).set({ monitorNextCheckAt: at,
+      executionPolicy: { monitor: { nextCheckAt: at.toISOString() } } }).where(eq(issues.id, f.issue.id));
+    const ownerId = randomUUID();
+    const hold = () => ({ ownerId, draining: true, activeRuns: 0, pendingWakes: 0,
+      startedAt: now, expiresAt: new Date(now.getTime() + 120_000) });
+    const report = await readIdleSleepSafety(db, hold, () => now.getTime(), ownerId,
+      async () => "none", undefined, undefined, true, true);
+    expect(report).toMatchObject({ version: 2, backgroundWork: "none", scheduledWake: {
+      kind: "routines_and_issue_monitors", nextWakeAt: at.toISOString() } });
+    expect(await f.scheduler.tickTimers(now)).toEqual({ checked: 0, enqueued: 0, skipped: 0 });
+    expect(f.deps.enqueueWakeup).not.toHaveBeenCalled();
+    const restored = createHeartbeatScheduling(db, f.deps);
+    const deadline = new Date(report.scheduledWake!.nextWakeAt);
+    await Promise.all([restored.tickTimers(deadline), f.scheduler.tickTimers(deadline)]);
+    expect(f.deps.enqueueWakeup).toHaveBeenCalledOnce();
+    expect(f.deps.enqueueWakeup).toHaveBeenCalledWith(f.agent.id, expect.objectContaining({ reason: "issue_monitor_due" }));
+    expect(await readIssue(f.issue.id)).toMatchObject({ monitorNextCheckAt: null, monitorAttemptCount: 1 });
+  });
+
   it("preserves a replacement schedule written during wake admission", async () => {
     const f = await fixture();
     const replacement = new Date(now.getTime() + 60_000);
@@ -156,6 +181,50 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
     expect(calls[0]![1]!.issueStateGuard).toMatchObject({
       assigneeAgentId: f.agent.id, statuses: ["in_progress"], monitorNextCheckAt: dueAt.toISOString(), monitorWakeRequestedAt: now.toISOString(),
     });
+  });
+
+  async function quotaMonitorFixture() {
+    const f = await fixture();
+    const [sourceRun] = await db.insert(heartbeatRuns).values({
+      companyId: f.company.id, agentId: f.agent.id, status: "failed", errorCode: "provider_quota",
+      finishedAt: dueAt, contextSnapshot: { issueId: f.issue.id }, scheduledRetryAttempt: 2,
+      resultJson: { conversationContinuation: CONVERSATION_CONTINUATION_POLICY },
+    }).returning();
+    await db.update(issues).set({ executionPolicy: { mode: "normal", commentRequired: true, stages: [], monitor: {
+      nextCheckAt: dueAt.toISOString(), serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME, externalRef: sourceRun!.id,
+    } } }).where(eq(issues.id, f.issue.id));
+    f.deps.scheduleBoundedRetryForRun.mockResolvedValue({ outcome: "retry_exhausted", attempt: 3, maxAttempts: 2 });
+    return f;
+  }
+
+  it("wakes the agent when a quota monitor fires after bounded retries are exhausted", async () => {
+    const f = await quotaMonitorFixture();
+    expect(await f.scheduler.tickTimers(now)).toEqual({ checked: 1, enqueued: 1, skipped: 0 });
+    expect(f.deps.scheduleBoundedRetryForRun).toHaveBeenCalledOnce();
+    expect(f.deps.enqueueWakeup).toHaveBeenCalledOnce();
+    expect(f.deps.enqueueWakeup).toHaveBeenCalledWith(f.agent.id, expect.objectContaining({
+      reason: "issue_monitor_due",
+      payload: expect.objectContaining({ issueId: f.issue.id, serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME }),
+    }));
+    expect(await readIssue(f.issue.id)).toMatchObject({ monitorNextCheckAt: null, monitorAttemptCount: 1 });
+  });
+
+  it("retains an exhausted quota monitor whose wake is deferred without consuming an attempt", async () => {
+    const f = await quotaMonitorFixture();
+    f.deps.enqueueWakeup.mockResolvedValueOnce(null);
+    expect(await f.scheduler.tickTimers(now)).toEqual({ checked: 1, enqueued: 0, skipped: 1 });
+    expect(await readIssue(f.issue.id)).toMatchObject({ monitorNextCheckAt: dueAt, monitorWakeRequestedAt: null, monitorAttemptCount: 0 });
+    expect(await f.scheduler.tickTimers(now)).toEqual({ checked: 1, enqueued: 1, skipped: 0 });
+    expect(f.deps.enqueueWakeup).toHaveBeenCalledTimes(2);
+    expect(await readIssue(f.issue.id)).toMatchObject({ monitorNextCheckAt: null, monitorAttemptCount: 1 });
+  });
+
+  it("does not also wake the agent when a quota monitor schedules a bounded retry", async () => {
+    const f = await quotaMonitorFixture();
+    f.deps.scheduleBoundedRetryForRun.mockResolvedValue({ outcome: "scheduled", run: admitted } as Awaited<
+      ReturnType<HeartbeatSchedulingDependencies["scheduleBoundedRetryForRun"]>>);
+    expect(await f.scheduler.tickTimers(now)).toEqual({ checked: 1, enqueued: 1, skipped: 0 });
+    expect(f.deps.enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it("keeps manual error recovery distinct from scheduled client-error handling", async () => {

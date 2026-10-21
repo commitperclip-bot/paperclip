@@ -1,4 +1,8 @@
-# Status cards and refreshed summaries
+---
+navigation: {"section":"Automation and structured work","sectionOrder":60,"order":40}
+---
+
+# Status cards
 
 The status-card experiment turns a saved prompt/query into an inspectable summary of watched work, with refresh history, configuration, and archive/restore controls.
 
@@ -44,3 +48,33 @@ Manual: Change a disposable card’s prompt or summarizer, run the offered rebui
 - Summary quality needs comparison against source work, not just a successful task status.
 - A saved old summary must not be counted as a successful new refresh.
 - Experimental visibility, author permissions, and agent ownership constrain mutation.
+
+### Storybook verification
+
+#### `authoring`
+
+Scope: ui
+Storybook: Mount CreateStatusCardDialog and StatusCardSettingsForm prompt, summarizer, refresh options, required/invalid inputs and save errors.
+Production: POST /companies/{id}/status-cards and PATCH /status-cards/{id} must enforce gate/author authority, save configuration and start expected compile task when prompt changes.
+Sources: Source: [CreateStatusCardDialog.tsx](../../ui/src/pages/StatusCards/CreateStatusCardDialog.tsx), [StatusCardSettingsForm.tsx](../../ui/src/pages/StatusCards/StatusCardSettingsForm.tsx), [status-cards.ts](../../server/src/routes/status-cards.ts). Tests: [StatusCardSettingsForm.test.tsx](../../ui/src/pages/StatusCards/StatusCardSettingsForm.test.tsx), [status-cards.test.ts](../../server/src/__tests__/status-cards.test.ts)
+
+#### `generation`
+
+Scope: ui
+Storybook: Mount card tile/drawer compiling, refreshing, failed, stale existing summary and successful new-summary states with linked task.
+Production: POST /status-cards/{id}/recompile and /refresh plus update/finalization engine must persist actual new output/history; compare saved summary with source tasks, not merely successful task status.
+Sources: Source: [StatusCardTile.tsx](../../ui/src/pages/StatusCards/StatusCardTile.tsx), [StatusCardDetailDrawer.tsx](../../ui/src/pages/StatusCards/StatusCardDetailDrawer.tsx), [status-cards.ts](../../server/src/routes/status-cards.ts), [status-card-update-engine.ts](../../server/src/services/status-card-update-engine.ts). Tests: [StatusCardTile.test.tsx](../../ui/src/pages/StatusCards/StatusCardTile.test.tsx), [status-cards.test.ts](../../server/src/__tests__/status-cards.test.ts), [status-card-update-engine.test.ts](../../server/src/__tests__/status-card-update-engine.test.ts)
+
+#### `inspection`
+
+Scope: ui
+Storybook: Mount StatusCardDetailDrawer summary, watched work, update/revision history, query debug, empty/loading/error and stale summary disclosure.
+Production: GET /status-cards/{id}, /updates, /summary-revisions and /dry-run must filter accessible card/source records; fixtures cannot establish summary truth or query authorization.
+Sources: Source: [StatusCardDetailDrawer.tsx](../../ui/src/pages/StatusCards/StatusCardDetailDrawer.tsx), [status-cards.ts](../../server/src/routes/status-cards.ts). Tests: [StatusCardTile.test.tsx](../../ui/src/pages/StatusCards/StatusCardTile.test.tsx), [status-cards.test.ts](../../server/src/__tests__/status-cards.test.ts)
+
+#### `archive`
+
+Scope: ui
+Storybook: Mount StatusCards and ArchivedStatusCardRow active/archived list, restore pending/failure and old-summary state. Archive differs from deletion.
+Production: PATCH /status-cards/{id} archived true/false must persist and authorize change; restore may enqueue refresh, whose new outcome must be inspected rather than treating old summary as current.
+Sources: Source: [index.tsx](../../ui/src/pages/StatusCards/index.tsx), [ArchivedStatusCardRow.tsx](../../ui/src/pages/StatusCards/ArchivedStatusCardRow.tsx), [status-cards.ts](../../server/src/routes/status-cards.ts). Tests: [status-cards.test.ts](../../server/src/__tests__/status-cards.test.ts), [status-card-update-engine.test.ts](../../server/src/__tests__/status-card-update-engine.test.ts)

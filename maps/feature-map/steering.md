@@ -1,3 +1,7 @@
+---
+navigation: {"section":"Tasks and conversations","sectionOrder":20,"order":60}
+---
+
 # Steering and queued messages
 
 People can send follow-ups while an agent works, manage saved messages that have
@@ -66,6 +70,14 @@ cover durable ordering, authorization, steering acknowledgements, interrupt
 recovery, and concurrent dispatch. [Composer](../../ui/src/components/task-chat/TaskChatComposer.test.tsx)
 covers drafts and uncertain saves.
 
+[Task-detail delivery races](../../ui/src/pages/IssueDetail.test.tsx) cover a
+consumed message whose send response and queue snapshot arrive late. A started
+run's input receipt removes that message from pending, while a separate unsent
+message stays queued. Admission to a run that has not started is not delivery.
+A later retry of the same message remains visible in its new authoritative queue.
+Receipts retain the primary wake and coalesced source queue IDs. They clear a late
+snapshot even when its target names the preceding run or is null.
+
 ```sh
 pnpm exec vitest run ui/src/components/task-chat/TaskChatQueuedMessages.test.tsx server/src/__tests__/issue-queued-comments-routes.test.ts
 ```
@@ -78,6 +90,8 @@ fixture and opt-in prerequisites; skipped native cases are not native proof.
 
 Manual: queue three distinguishable messages. Edit one, reorder them, reload,
 and confirm the saved order. Discard one and confirm it never reaches execution.
+After a queued message enters a started run, confirm it leaves pending even if
+the send response arrives later. Reload and confirm it appears once in history.
 Steer one while busy and verify the agent receives that exact message once.
 Repeat with a rejected steer and a stale second-tab edit; the UI must preserve
 retryable content and explain the conflict. On a fresh run, interrupt with a
@@ -135,3 +149,19 @@ gap; do not assume browser queue controls are available in every channel.
 - An interrupted run may need verified cleanup before a saved follow-up can
   start. Preserve and inspect the wait reason; see [recovery](./recovery.md).
 - A healthy idle Agent Chat is waiting for input, not stranded unfinished work.
+
+### Storybook verification
+
+#### `drafts`
+
+Scope: ui
+Storybook: Task-keyed restored draft and attachment receipts; task switch/reload, failed send and uncertain-save recovery.
+Production: Retain correct task draft across navigation and reload; inspect authoritative saved receipt before claiming delivery; do not clear storage on every harness mount.
+Sources: Source: [TaskChatComposer.tsx](../../ui/src/components/task-chat/TaskChatComposer.tsx), [composer-draft.ts](../../ui/src/lib/composer-draft.ts). Tests: [TaskChatComposer.test.tsx](../../ui/src/components/task-chat/TaskChatComposer.test.tsx), [issue-queued-comments-routes.test.ts](../../server/src/__tests__/issue-queued-comments-routes.test.ts)
+
+#### `approval-queue`
+
+Scope: ui
+Storybook: Answered question/accepted approval delivery waiting, eligible steer/interrupt, failed delivery and fresh-session-only approval.
+Production: Keep response delivery durable and distinct from editable comments; coalesce once, enforce fresh-session restrictions and deduplicate concurrent/retried continuation.
+Sources: Source: [TaskChatQueuedMessages.tsx](../../ui/src/components/task-chat/TaskChatQueuedMessages.tsx), [question-response-delivery.ts](../../server/src/services/question-response-delivery.ts). Tests: [TaskChatQueuedMessages.test.tsx](../../ui/src/components/task-chat/TaskChatQueuedMessages.test.tsx), [question-response-delivery.test.ts](../../server/src/__tests__/question-response-delivery.test.ts), [issue-queued-comments-routes.test.ts](../../server/src/__tests__/issue-queued-comments-routes.test.ts)

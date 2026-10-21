@@ -45,6 +45,7 @@ const apiPrefixes: Record<string, string> = {
   "costs.ts": "/api",
   "dashboard.ts": "/api",
   "dot-runner.ts": "/api",
+  "grok-bot.ts": "/api",
   "decision-queues.ts": "/api",
   "decisions.ts": "/api",
   "decision-training.ts": "/api",
@@ -55,6 +56,7 @@ const apiPrefixes: Record<string, string> = {
   "folders.ts": "/api",
   "goals.ts": "/api",
   "health.ts": "/api/health",
+  "liveness.ts": "/api/liveness",
   "inbox-agent-policy.ts": "/api",
   "inbox-dismissals.ts": "/api",
   "instance-database-backups.ts": "/api",
@@ -87,9 +89,9 @@ const apiPrefixes: Record<string, string> = {
 };
 
 const ROUTE_LITERAL_PATTERN =
-  /router\.(get|post|put|patch|delete)\(\s*["'`]([^"'`]+)["'`]/g;
-const ROUTE_ARRAY_PATTERN = /router\.(get|post|put|patch|delete)\(\s*\[([^\]]+)\]/g;
-const ROUTER_METHOD_PATTERN = /router\.(get|post|put|patch|delete)\(/;
+  /router\.(get|head|post|put|patch|delete)\(\s*["'`]([^"'`]+)["'`]/g;
+const ROUTE_ARRAY_PATTERN = /router\.(get|head|post|put|patch|delete)\(\s*\[([^\]]+)\]/g;
+const ROUTER_METHOD_PATTERN = /router\.(get|head|post|put|patch|delete)\(/;
 const HTTP_METHODS = new Set([
   "get",
   "put",
@@ -183,7 +185,7 @@ function resolveMountedPath(file: string, prefix: string, routePath: string) {
   ) {
     return routePath;
   }
-  if ((file === "companies.ts" || file === "health.ts") && routePath === "/") {
+  if ((file === "companies.ts" || file === "health.ts" || file === "liveness.ts") && routePath === "/") {
     return prefix;
   }
   if (file === "companies.ts" || file === "health.ts") {
@@ -246,11 +248,11 @@ function loadActualRoutes() {
         }
       }
     }
-    if (file === "dot-runner.ts") {
-      for (const name of ["path", "invitePath"]) {
+    if (file === "dot-runner.ts" || file === "grok-bot.ts") {
+      for (const name of file === "dot-runner.ts" ? ["path", "invitePath"] : ["path"]) {
         const basePath = new RegExp(`const ${name} = "([^"]+)"`).exec(source)?.[1];
         if (!basePath) throw new Error(`Dot ${name} route prefix is missing`);
-        const methods = new RegExp(`router\\.(get|post|delete)\\(${name}(?: \\+ "([^"]+)")?`, "g");
+        const methods = new RegExp(`router\\.(get|post|put|delete)\\(${name}(?: \\+ "([^"]+)")?`, "g");
         for (const match of source.matchAll(methods)) {
           routes.add(`${match[1].toUpperCase()} ${normalizeExpressPath(prefix + basePath + (match[2] ?? ""))}`);
         }
@@ -296,6 +298,17 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents anonymous liveness separately from database readiness", () => {
+    const spec = buildOpenApiSpec() as any;
+    for (const method of ["get", "head"]) {
+      const operation = spec.paths["/api/liveness"][method];
+      expect(operation.security).toEqual([]);
+      expect(operation.responses[503]).toBeDefined();
+    }
+    expect(Object.keys(spec.paths["/api/liveness"].get.responses[200].content["application/json"].schema.properties))
+      .toEqual(["status", "commit"]);
+    expect(spec.paths["/api/health"].get.responses[503]).toBeDefined();
+  });
   it("documents only writable agent update fields and lifecycle status requests", () => {
     const document = buildOpenApiSpec() as any;
     const properties = document.paths["/api/agents/{id}"].patch.requestBody.content["application/json"].schema.properties;

@@ -1,4 +1,4 @@
-//! Dot is an external service. This executor owns the durable turn and tool
+//! Dot and Grok Bot are external services. This executor owns the durable turn and tool
 //! receipts; the authenticated controller owns OAuth, the mailbox and policy.
 //! No network credential or callback address enters this provider descriptor.
 use std::collections::{BTreeMap, VecDeque};
@@ -99,6 +99,22 @@ fn bounded_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"._:-".contains(&c))
 }
 
+fn external_driver(kind: &str) -> &'static str {
+    if kind == "grok_bot" {
+        "grok_bot_mcp"
+    } else {
+        "openai_dot_mcp"
+    }
+}
+
+fn external_revision(kind: &str) -> &'static str {
+    if kind == "grok_bot" {
+        "grok-bot-mcp-v1"
+    } else {
+        "dot-mcp-v1"
+    }
+}
+
 impl State {
     fn validate(&self, config: &DurableRunnerConfig) -> Result<(), DurableRunnerError> {
         let d = &self.descriptor;
@@ -106,7 +122,7 @@ impl State {
             || self.run_id != config.run_id
             || self.session_id != config.normalized_session_id
             || self.turn_id != config.turn_id
-            || d.kind != "openai_dot"
+            || !matches!(d.kind.as_str(), "openai_dot" | "grok_bot")
             || !bounded_id(&d.company_id)
             || !bounded_id(&d.agent_id)
             || !bounded_id(&d.binding_id)
@@ -343,7 +359,13 @@ impl DotCommandExecutor {
                 next_event: 1,
             });
         }
-        Ok(json!({"status":"prepared","provider":"openai_dot","driver":"openai_dot_mcp"}))
+        let s = self
+            .state
+            .as_ref()
+            .ok_or_else(|| invalid("External bot is not prepared"))?;
+        Ok(
+            json!({"status":"prepared","provider":s.descriptor.kind,"driver":external_driver(&s.descriptor.kind)}),
+        )
     }
 
     fn operation(&mut self, value: &Value) -> Result<Value, DurableRunnerError> {
@@ -384,7 +406,7 @@ impl DotCommandExecutor {
                     return Err(invalid("Dot assignment is unavailable for acceptance"));
                 }
                 state.lifecycle = "running".to_owned();
-                state.push("turn.started", json!({"provider":"openai_dot","providerTurnId":state.turn_id,"turnId":state.turn_id}))?;
+                state.push("turn.started", json!({"provider":state.descriptor.kind,"providerTurnId":state.turn_id,"turnId":state.turn_id}))?;
                 json!({"status":"accepted"})
             }
             "tool" => {
@@ -432,7 +454,7 @@ impl DotCommandExecutor {
                     .as_str()
                     .filter(|s| !s.is_empty() && s.len() <= 12000)
                     .ok_or_else(|| invalid("Dot progress must be bounded text"))?;
-                state.push("item.completed", json!({"provider":"openai_dot","item":{"id":id,"type":"agentMessage","text":text,"phase":"commentary"}}))?;
+                state.push("item.completed", json!({"provider":state.descriptor.kind,"item":{"id":id,"type":"agentMessage","text":text,"phase":"commentary"}}))?;
                 json!({"status":"completed"})
             }
             "finish" => {
@@ -455,8 +477,8 @@ impl DotCommandExecutor {
                     .settle_turn("completed")
                     .map_err(|e| invalid(e.to_string()))?;
                 state.push("run.result.proposed", result.clone())?;
-                state.push("item.completed", json!({"provider":"openai_dot","item":{"id":id,"type":"agentMessage","text":result["summary"],"phase":"final_answer"}}))?;
-                state.push("turn.completed", json!({"provider":"openai_dot","providerTurnId":state.turn_id,"status":"completed"}))?;
+                state.push("item.completed", json!({"provider":state.descriptor.kind,"item":{"id":id,"type":"agentMessage","text":result["summary"],"phase":"final_answer"}}))?;
+                state.push("turn.completed", json!({"provider":state.descriptor.kind,"providerTurnId":state.turn_id,"status":"completed"}))?;
                 state.push("run.terminal", json!({"schema":"paperclip.prp.terminal.v1","turnTerminalState":"completed","runTerminalState":"succeeded","reportedWorkDisposition":result["reportedWorkDisposition"]}))?;
                 json!({"status":"completed"})
             }
@@ -566,9 +588,9 @@ impl DotCommandExecutor {
                     .ok_or_else(|| invalid("Dot is not prepared"))?;
                 if s.lifecycle == "prepared" {
                     s.lifecycle = "open".to_owned();
-                    s.push("session.started", json!({"provider":"openai_dot","driver":"openai_dot_mcp","providerVersion":"dot-mcp-v1",
+                    s.push("session.started", json!({"provider":s.descriptor.kind,"driver":external_driver(&s.descriptor.kind),"providerVersion":external_revision(&s.descriptor.kind),
                         "driverSessionId":s.session_id,"providerSessionId":null,"sessionId":s.session_id,"model":null,
-                        "providerDescriptor":{"provider":"openai_dot","driver":"openai_dot_mcp","executionKind":"remote_service","service":"openai_dot","model":null,"providerVersion":"unknown","providerSessionId":null,"processId":null}}))?;
+                        "providerDescriptor":{"provider":s.descriptor.kind,"driver":external_driver(&s.descriptor.kind),"executionKind":"remote_service","service":s.descriptor.kind,"model":null,"providerVersion":"unknown","providerSessionId":null,"processId":null}}))?;
                 }
                 Ok(
                     json!({"status":"started","driverSessionId":s.session_id,"providerSessionId":null}),
@@ -604,7 +626,7 @@ impl DotCommandExecutor {
                     .as_ref()
                     .ok_or_else(|| invalid("Dot is not prepared"))?;
                 Ok(
-                    json!({"status":s.lifecycle,"provider":"openai_dot","driver":"openai_dot_mcp","driverSessionId":s.session_id,
+                    json!({"status":s.lifecycle,"provider":s.descriptor.kind,"driver":external_driver(&s.descriptor.kind),"driverSessionId":s.session_id,
                     "providerSessionId":null,"activeProviderTurnId":if matches!(s.lifecycle.as_str(), "offered" | "running") {Some(&s.turn_id)} else {None},
                     "operationCount":s.operations.len(),"pendingTools":s.tools.pending_calls().count(),"binding":s.binding()}),
                 )
@@ -620,7 +642,7 @@ impl DotCommandExecutor {
                         .settle_turn("authority_revoked")
                         .map_err(|e| invalid(e.to_string()))?;
                     s.push("external_provider.dispatch_requested", json!({"binding":s.binding(),"kind":"authority_revoked","externalStopConfirmed":false}))?;
-                    s.push("turn.cancelled", json!({"provider":"openai_dot","providerTurnId":s.turn_id,"externalStopConfirmed":false}))?;
+                    s.push("turn.cancelled", json!({"provider":s.descriptor.kind,"providerTurnId":s.turn_id,"externalStopConfirmed":false}))?;
                     s.push("run.terminal", json!({"schema":"paperclip.prp.terminal.v1","turnTerminalState":"cancelled","runTerminalState":"cancelled","reportedWorkDisposition":"needs_review"}))?;
                 }
                 Ok(
@@ -680,7 +702,7 @@ impl CommandExecutor for DotCommandExecutor {
             let expiry = (|| -> Result<(), DurableRunnerError> {
                 s.tools.settle_turn("authority_expired").map_err(|e| invalid(e.to_string()))?;
                 s.push("external_provider.dispatch_requested", json!({"binding":s.binding(),"kind":"authority_revoked","reason":"authority_expired","externalStopConfirmed":false}))?;
-                s.push("turn.failed", json!({"provider":"openai_dot","providerTurnId":s.turn_id,"error":{"code":"dot_assignment_expired","message":"Dot assignment acceptance or execution authority expired."}}))?;
+                s.push("turn.failed", json!({"provider":s.descriptor.kind,"providerTurnId":s.turn_id,"error":{"code":"dot_assignment_expired","message":"Dot assignment acceptance or execution authority expired."}}))?;
                 s.push("run.terminal", json!({"schema":"paperclip.prp.terminal.v1","turnTerminalState":"failed","runTerminalState":"failed","reportedWorkDisposition":"needs_review"}))?;
                 Ok(())
             })().and_then(|_| self.save());
@@ -791,6 +813,10 @@ mod tests {
             "digest":semantic_value_digest(&json!({"action":action,"input":input})),"action":action,"input":input})
     }
     fn prepared(path: &std::path::Path) -> DotCommandExecutor {
+        prepared_for(path, "openai_dot")
+    }
+
+    fn prepared_for(path: &std::path::Path, provider: &str) -> DotCommandExecutor {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -817,7 +843,7 @@ mod tests {
         call(
             &mut executor,
             "run.prepare",
-            json!({"provider":{"kind":"openai_dot","companyId":"company-1","agentId":"agent-1",
+            json!({"provider":{"kind":provider,"companyId":"company-1","agentId":"agent-1",
             "bindingId":"binding-1","bindingGeneration":1,"acceptByUnixMs":now+600000,"expiresAtUnixMs":now+7200000,"instructions":"test"},
             "completionContract":{"revision":"contract-1","criterionIds":["criterion-1"]},"authorizedTools":catalog}),
         );
@@ -832,6 +858,61 @@ mod tests {
             operation("accept-1", "accept", json!({})),
         );
     }
+    #[test]
+    fn grok_identity_survives_recovery_and_revocation_without_claiming_remote_termination() {
+        let dir = TestDirectory::new();
+        let mut executor = prepared_for(dir.path(), "grok_bot");
+        let events = executor.poll_events().unwrap();
+        assert!(events.iter().any(|e| e.event_type == "session.started"
+            && e.payload["provider"] == "grok_bot"
+            && e.payload["driver"] == "grok_bot_mcp"));
+        accept(&mut executor);
+        let progress = operation(
+            "progress-1",
+            "progress",
+            json!({"text":"Synthetic Grok progress"}),
+        );
+        let result = call(
+            &mut executor,
+            "external_provider.operation",
+            progress.clone(),
+        );
+        drop(executor);
+        let mut recovered = DotCommandExecutor::with_runner_config(dir.path(), &config(dir.path()));
+        assert_eq!(
+            call(&mut recovered, "external_provider.operation", progress),
+            result
+        );
+        let snapshot = call(&mut recovered, "session.snapshot", json!({}));
+        assert_eq!(snapshot["provider"], "grok_bot");
+        assert_eq!(snapshot["driver"], "grok_bot_mcp");
+        let state = recovered.state.as_ref().unwrap();
+        let mut descriptor = serde_json::to_value(&state.descriptor).unwrap();
+        descriptor["kind"] = json!("openai_dot");
+        let tools = state.tools.authorized_tools().cloned().collect::<Vec<_>>();
+        let catalog = AuthorizedToolSet {
+            schema: "paperclip.runner.authorized-tools.v1".into(),
+            schema_version: 1,
+            catalog_digest: authorized_tool_catalog_digest(&tools).unwrap(),
+            operations: tools,
+        };
+        let changed = json!({"provider":descriptor,"completionContract":state.completion_contract,"authorizedTools":catalog});
+        let error = recovered
+            .execute(&command("run.prepare", changed))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("immutable provider authority changed"));
+        let revoked = call(&mut recovered, "run.cancel", json!({}));
+        assert_eq!(revoked["externalStopConfirmed"], false);
+        assert!(recovered
+            .execute(&command(
+                "external_provider.operation",
+                operation("late", "progress", json!({"text":"late"}))
+            ))
+            .is_err());
+    }
+
     #[test]
     fn renewal_is_durable_bounded_and_cannot_revive_fenced_authority() {
         let dir = TestDirectory::new();

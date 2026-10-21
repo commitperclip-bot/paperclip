@@ -65,7 +65,16 @@ function Journey(props: { openInitially?: boolean }) {
 const meta = {
   id: "html-artifacts-03-task-journey",
   title: "Tasks and conversations/Documents, attachments, and work products/HTML artifacts/03 Task journey", component: Journey,
-  parameters: { layout: "fullscreen", initialEntries: ["/PAP/issues/html-artifact-journey"], docs: { description: { component: "Open the HTML artifact from the task's report card or Artifacts tab, filter the report, then switch to Raw beside Download. Uses the production app shell, artifact card, task panel and HTML renderer with simulated report data." }, story: { inline: false } } },
+  parameters: { layout: "fullscreen", initialEntries: ["/PAP/issues/html-artifact-journey"], docs: { description: { component: "Open the HTML artifact from the task's report card or Artifacts tab, filter the report, then switch to Raw beside Download. Uses the production app shell, artifact card, task panel and HTML renderer with simulated report data." }, story: { inline: false } },
+    paperclip: {
+      "capabilities": [
+        "documents-artifacts/attachments",
+        "workspaces/files-git"
+      ],
+      "implementation": "production",
+      "boundary": "fixtures"
+    },
+  },
   beforeEach: () => {
     const originalFetch = window.fetch;
     const fixtureFetch: typeof window.fetch = async (input, init) => {

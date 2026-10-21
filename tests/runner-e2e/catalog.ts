@@ -101,6 +101,7 @@ function commonAgent(
     capabilities:
       "Completes deterministic standard, planning, and ask-mode runner acceptance tasks.",
     adapterType,
+    ...(adapterType === "codex_local" ? { runner: "legacy" as const } : {}),
     adapterConfig,
     defaultEnvironmentId: input.environmentId,
     budgetMonthlyCents: 0,
@@ -1366,7 +1367,8 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
         ...(["hire-reuse", "delegate-feedback"].includes(task.id) ? [] : [`everyday-workflows.runner-opencode.local.${task.id}`]),
       ]),
     ],
-    definitionMetadata: { version: 6, instructions: "production", grading: "outcome-and-invariants", scheduling: "explicit-only",
+    definitionMetadata: { version: 7, instructions: "production", grading: "outcome-and-invariants", scheduling: "explicit-only",
+      remoteCodexRestart: "same-active-process-lease-native-prefix-and-workspace-receipt",
       procedureCases: { ids: ["hire-reuse", "delegate-feedback"], maximumAttemptsPerCell: 1, companyAndLeadBudgetCents: 1_000 } },
   },
   {
@@ -1439,7 +1441,7 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     groups: ["onboarding"],
     profiles: runnerProfiles.filter(profile => ["legacy-codex", "legacy-claude", "runner-codex", "runner-acpx-claude"].includes(profile.id)),
     environments: [localEnvironment], tasks: firstTaskTasks, expectedMatrixSize: 52,
-    definitionMetadata: { version: 4, runGrading: "evidenced-nonexecution-and-refusal", credentialPersistenceCheck: false, questionChoiceMinimum: 2, nativeSetup: "post-onboarding-runtime-switch", productionInstructions: true, qualityGrading: "informational" },
+    definitionMetadata: { version: 5, runGrading: "evidenced-nonexecution-and-refusal", credentialPersistenceCheck: false, questionChoiceMinimum: 2, nativeSetup: "codex-production-default-claude-explicit-runtime-switch", productionInstructions: true, qualityGrading: "informational" },
   },
   {
     id: "agent-chat", label: "Persistent Agent Chat",
@@ -1495,10 +1497,14 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     groups: ["chat", "native"],
     profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id))
       .map(profile => productionStoryProfile(defaultPermissionProfile(profile))),
-    environments: [localEnvironment],
+    environments: [localEnvironment, runnerEnvironments.find(environment => environment.id === "daytona")!],
+    excludedExecutionIds: ["runner-codex", "runner-acpx-claude"].flatMap(profile =>
+      [...firstTaskTasks.filter(task => ["task-reply-accept", "interview-plan-accept", "reject-no-execution", "task-card-accept"].includes(task.id)), ...chatConfirmationTasks]
+        .map(task => `confirmation-replies.${profile}.daytona.${task.id}`)
+        .filter(id => id !== "confirmation-replies.runner-codex.daytona.task-card-accept")),
     tasks: [...firstTaskTasks.filter(task => ["task-reply-accept", "interview-plan-accept", "reject-no-execution", "task-card-accept"].includes(task.id)), ...chatConfirmationTasks],
-    expectedMatrixSize: 12,
-    definitionMetadata: { version: 6, instructions: "production", grading: "card-message-provenance-before-child-creation", unansweredQuestionComposer: "history-card-only-including-fresh-dismissal", completionObservation: "120-seconds", scheduling: "explicit-only" },
+    expectedMatrixSize: 13,
+    definitionMetadata: { version: 7, managedOnboarding: "ui-owned-qualification-and-physical-file", managedExpectedTaskRuns: 4, managedAutomaticRetries: 0, instructions: "production", grading: "card-message-provenance-before-child-creation", unansweredQuestionComposer: "history-card-only-including-fresh-dismissal", completionObservation: "120-seconds", scheduling: "explicit-only" },
   },
   {
     id: "completion-updates", label: "Delegated Completion Updates", manualOnly: true,
@@ -1676,8 +1682,10 @@ export function buildRunnerMatrix(
               suiteDefinitionHash: suiteDefinitionHash(suite),
               profile,
               environment,
-              task: suite.id === "extended-harnesses" && profile.qualificationCandidate === "pi" && task.id === "file-edit-validate"
-                ? { ...task, buildPrompt: piFilePrompt } : task,
+              task: suite.id === "confirmation-replies" && profile.id === "runner-codex" && environment.id === "daytona" && task.id === "task-card-accept"
+                ? { ...task, expectedRunCount: 4, automaticRetryPolicy: "single_attempt" as const }
+                : suite.id === "extended-harnesses" && profile.qualificationCandidate === "pi" && task.id === "file-edit-validate"
+                  ? { ...task, buildPrompt: piFilePrompt } : task,
               groups: [
                 ...new Set([
                   ...suite.groups,

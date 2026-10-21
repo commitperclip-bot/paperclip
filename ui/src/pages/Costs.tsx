@@ -952,7 +952,7 @@ export function Costs({
                   <div>
                     <h2 className="text-lg font-semibold">Active incidents</h2>
                     <p className="text-sm text-muted-foreground">
-                      Resolve hard stops here by raising the budget or explicitly keeping the scope paused.
+                      Raise the budget or keep a hard stop paused. Dismiss a warning when no action is needed.
                     </p>
                   </div>
                   <div className="grid gap-4 xl:grid-cols-2">

@@ -157,7 +157,7 @@ export function createDiscordGatewayEvents(db: Db, options: DiscordGatewayEvents
         if (current.status === "attention" && !gatewayOwnedAttention) return;
         const status =
           current.setup.step === "complete" ? "active" : "verifying";
-        if (status !== current.status) await notifyChatEndpointWork(tx);
+        if (status !== current.status) await notifyChatEndpointWork(tx, current.connectionId);
         await tx
           .update(chatEndpoints)
           .set({

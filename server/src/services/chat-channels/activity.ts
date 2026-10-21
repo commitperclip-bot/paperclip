@@ -1,7 +1,7 @@
 import { providerEffectPayload } from "./provider-effects.js";
 
 import { slackSlashTaskRecoveryPayload } from "./slack/task-start.js";
-import { GITHUB_RECOVERY_STATE_KEY } from "./github/webhook-ingress.js";
+import { githubRecoveryActivity } from "./github/activity.js";
 
 import {
   and,
@@ -19,7 +19,6 @@ import {
   chatConversations,
   chatDeliveries,
   chatPublications,
-  chatSdkState,
   chatTeamsFileTransfers,
   issues,
 } from "@paperclipai/db";
@@ -270,17 +269,7 @@ export function createChatActivity(db: Db, options: ChatActivityOptions) {
         )
         .orderBy(desc(sql`date_trunc('milliseconds', ${chatActions.updatedAt})`), desc(chatActions.id))
         .limit(limit),
-      db
-        .select()
-        .from(chatSdkState)
-        .where(
-          and(
-            eq(chatSdkState.endpointId, endpointId),
-            before(chatSdkState.updatedAt, chatSdkState.id),
-            eq(chatSdkState.stateKey, GITHUB_RECOVERY_STATE_KEY),
-          ),
-        )
-        .limit(1),
+      githubRecoveryActivity(db, endpointId, page?.before),
     ]);
     // A provider effect can be on another page. Replay safety must still
     // consider every unresolved effect associated with these deliveries.
@@ -559,31 +548,7 @@ export function createChatActivity(db: Db, options: ChatActivityOptions) {
         replayable: false,
         resolutionActions: [],
       })),
-      ...githubRecoveryScans.flatMap((row) => {
-        const value = row.value as { outcome?: string } | null;
-        const detail =
-          value?.outcome === "history_limit_reached"
-            ? "Recent webhook volume exceeded automatic recovery's bounded scan. No partial history was replayed. Check the App's Recent Deliveries for missed messages."
-            : value?.outcome === "callback_mismatch"
-              ? "The GitHub App's callback no longer matches this connection. Reconnect the App to repair it; repository access will not change."
-              : value?.outcome === "scan_failed"
-                ? "Paperclip could not check GitHub's failed deliveries. The check will retry with backoff; normal callbacks are still processed."
-                : null;
-        return detail
-          ? [
-              {
-                id: row.id,
-                kind: "health" as const,
-                status: "attention",
-                summary: "GitHub webhook recovery needs attention",
-                detail,
-                createdAt: row.updatedAt.toISOString(),
-                replayable: false,
-                resolutionActions: [],
-              },
-            ]
-          : [];
-      }),
+      ...githubRecoveryScans,
     ]
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))
       .slice(0, limit);

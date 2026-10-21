@@ -1,3 +1,7 @@
+---
+navigation: {"section":"Oversight and operation","sectionOrder":70,"order":30}
+---
+
 # Navigation, profile, and announcements
 
 People organize their sidebar, move between company resources, maintain their profile, and dismiss product announcements with the correct persistence and identity scope.
@@ -50,3 +54,19 @@ Manual: Change a disposable user’s display details, reload, and inspect an att
 - Announcement dismissals are intentionally instance-wide user preferences, unlike company-scoped domain data.
 - Legacy/production shells need their own navigation check when affected.
 - A route redirect is part of the journey; do not document a removed screen as if it still renders.
+
+### Storybook verification
+
+#### `preferences`
+
+Scope: ui
+Storybook: Mount Sidebar using real preference boundary with stars/order/collapse/recents state. Clearly distinguish in-memory section collapse, browser-local recents and server-saved stars/order.
+Production: GET/PUT /sidebar-preferences/me and /companies/{id}/sidebar-preferences/me plus stars must retain intended user/company isolation across reload and switch. Section collapse reopens after reload; global collapse is disabled.
+Sources: Source: [Sidebar.tsx](../../ui/src/components/Sidebar.tsx), [sidebar-preferences.ts](../../server/src/routes/sidebar-preferences.ts), [sidebar-preferences.ts](../../server/src/services/sidebar-preferences.ts). Tests: [Sidebar.test.tsx](../../ui/src/components/Sidebar.test.tsx), [sidebar-preferences-routes.test.ts](../../server/src/__tests__/sidebar-preferences-routes.test.ts)
+
+#### `fallbacks`
+
+Scope: browser
+Storybook: A NotFound rendering story can help polish, but missing-resource/legacy-deep-link capability principally needs real App/router/browser scenarios preserving company and query intent.
+Production: Cold-open invalid company/resource and retired URL; verify explicit fallback or correct canonical redirect without silently targeting a different resource/company.
+Sources: Source: [NotFound.tsx](../../ui/src/pages/NotFound.tsx), [App.tsx](../../ui/src/App.tsx), [company-routes.ts](../../ui/src/lib/company-routes.ts). Tests: [App.activity-routing.test.tsx](../../ui/src/App.activity-routing.test.tsx), [App.cases-routing.test.tsx](../../ui/src/App.cases-routing.test.tsx), [App.test.tsx](../../ui/src/App.test.tsx), [company-routes.test.ts](../../ui/src/lib/company-routes.test.ts)

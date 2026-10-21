@@ -21,6 +21,27 @@ export async function canonicalRepositoryRoot(cwd: string): Promise<string> {
   }
 }
 
+export async function resolveRepositoryRoots(cwds: Iterable<string>, requireExisting = false): Promise<Map<string, string | null>> {
+  const paths = [...new Set(cwds)];
+  const roots = new Map<string, string | null>();
+  let next = 0;
+  const settled = await Promise.allSettled(Array.from({ length: Math.min(16, paths.length) }, async () => {
+    while (next < paths.length) {
+      const cwd = paths[next++];
+      const root = await (requireExisting ? fs.realpath(cwd) : canonicalRepositoryRoot(cwd))
+        .catch((error: NodeJS.ErrnoException) => {
+          if (["ENOTDIR", "EACCES", "EPERM", "ELOOP", "ENAMETOOLONG"].includes(error.code ?? "")
+            || (requireExisting && error.code === "ENOENT")) return null;
+          throw error;
+        });
+      roots.set(cwd, root);
+    }
+  }));
+  const rejected = settled.find(result => result.status === "rejected");
+  if (rejected?.status === "rejected") throw rejected.reason;
+  return roots;
+}
+
 export function repositoryRootsOverlap(left: string, right: string): boolean {
   const contains = (parent: string, child: string) => {
     const relative = path.relative(parent, child);

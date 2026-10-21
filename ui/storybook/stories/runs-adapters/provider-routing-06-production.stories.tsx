@@ -163,7 +163,16 @@ function AgentConnectionModes() {
 const meta = {
   id: "ai-connections-provider-routing-06-production-components",
   title: "Agents and reusable capabilities/Runs, harnesses, and model accounts/AI Connections/Provider routing/06 Production components",
-  parameters: { layout: "fullscreen" },
+  parameters: { layout: "fullscreen",
+    paperclip: {
+      "capabilities": [
+        "runs-adapters/validation"
+      ],
+      "implementation": "production",
+      "boundary": "fixtures",
+      "notes": "Design-review route uses simulated account/provider state; audit the rendered subject before treating it as the live connection flow."
+    },
+  },
   decorators: [
     (Story) => (
       <ReviewFrame location="Production components: Connectors → provider row → Connect; Agents → Harness / Runtime. Fixtures supply data only.">

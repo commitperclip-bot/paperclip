@@ -53,7 +53,7 @@ export function createNativeSessionBackend(
   options: NativeBackendFactoryOptions = {},
 ): NativeSessionBackend {
   if (input.schema === "paperclip.native-execution-input.v6") {
-    if (!options.dotRunnerOptions) throw new Error("Dot requires an admitted broker port and Rust Runner authority");
+    if (!options.dotRunnerOptions) throw new Error("External bots require an admitted broker port and Rust Runner authority");
     return new HarnessDriverBackend(new RunnerdDotDriver({ ...options.dotRunnerOptions, execution: input,
       dynamicTools: options.dynamicTools, dynamicToolHandler: options.dynamicToolHandler,
       completionFeedback: options.completionFeedback, onSpawn: options.onSpawn }));

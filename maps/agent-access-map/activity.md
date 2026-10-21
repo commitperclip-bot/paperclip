@@ -90,6 +90,9 @@ Assert the relevant denied actor, owner, company or mode from Policy. Review the
 remaining operations before qualifying the whole capability.
 
 Gaps: Telemetry/run visibility is checked independently from seeing the source task.
+Company heartbeat history defaults to 200 rows and caps explicit limits at 1,000
+in both the route and service. The response remains an array. Scope, visibility,
+and secret redaction checks apply to the bounded result set.
 
 ## `routine-audit`
 

@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentConfigRevisions,
@@ -96,13 +96,24 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("plugin-managed agents", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let runnerSelectionSpy: { mockRestore(): void } | undefined;
+  const runnerTarget = { driver: "local", platform: "linux", architecture: "x64" };
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-managed-agents-");
     db = createDb(tempDb.connectionString);
   }, 20_000);
 
+  beforeEach(async () => {
+    runnerTarget.platform = "linux";
+    runnerTarget.architecture = "x64";
+    const selection = await import("../services/agent-runner-selection.js");
+    runnerSelectionSpy = vi.spyOn(selection, "resolveNewAgentRunnerForCompany").mockImplementation(async (_db, _companyId, input) =>
+      selection.resolveNewAgentRunner({ ...input, target: runnerTarget }));
+  });
+
   afterEach(async () => {
+    runnerSelectionSpy?.mockRestore();
     await db.delete(agentConfigRevisions);
     await db.delete(activityLog);
     await db.delete(pluginEntities);
@@ -272,7 +283,9 @@ describeEmbeddedPostgres("plugin-managed agents", () => {
     });
   });
 
-  it("creates managed agents with the most-used compatible company adapter", async () => {
+  it.each([{ platform: "linux", architecture: "x64" }, { platform: "linux", architecture: "arm64" }, { platform: "darwin", architecture: "arm64" }, { platform: "darwin", architecture: "x64" }])("creates managed agents with the most-used compatible company adapter ($platform/$architecture)", async ({ platform, architecture }) => {
+    runnerTarget.platform = platform;
+    runnerTarget.architecture = architecture;
     const pluginManifest = manifest();
     pluginManifest.agents![0] = {
       ...pluginManifest.agents![0]!,
@@ -288,8 +301,8 @@ describeEmbeddedPostgres("plugin-managed agents", () => {
         name: "Codex One",
         role: "engineer",
         status: "idle",
-        adapterType: "codex_local",
-        adapterConfig: {},
+        adapterType: "paperclip_runner",
+        adapterConfig: { provider: "codex", model: "gpt-5.4" },
         runtimeConfig: {},
         permissions: {},
       },
@@ -320,7 +333,13 @@ describeEmbeddedPostgres("plugin-managed agents", () => {
     const created = await services.agents.managedReconcile({ companyId, agentKey: "wiki-maintainer" });
 
     expect(created.status).toBe("created");
-    expect(created.agent?.adapterType).toBe("codex_local");
+    expect(created.agent).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "codex" } });
+    const reconciled = await services.agents.managedReconcile({ companyId, agentKey: "wiki-maintainer" });
+    expect(reconciled.agent?.adapterConfig).toEqual(created.agent?.adapterConfig);
+    runnerTarget.platform = "win32";
+    runnerTarget.architecture = "x64";
+    const reset = await services.agents.managedReset({ companyId, agentKey: "wiki-maintainer" });
+    expect(reset.agent).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "codex" } });
   });
 
   it("materializes declared managed agent instructions with local folder paths", async () => {

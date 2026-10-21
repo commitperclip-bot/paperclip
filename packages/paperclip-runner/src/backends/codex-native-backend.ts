@@ -11,7 +11,7 @@ import type {
 import type { CodexAppServerTransport } from "../drivers/codex/app-server-transport.js";
 import { CodexAppServerDriver } from "../drivers/codex/codex-app-server-driver.js";
 import type { CodexWorkingDirectoryAuthority } from "../drivers/codex/codex-boundaries.js";
-import { describeRunnerdDotDriver } from "../drivers/dot/runnerd-dot-driver.js";
+import { describeRunnerdExternalBotDriver } from "../drivers/dot/runnerd-dot-driver.js";
 import { HarnessDriverBackend } from "./harness-driver-backend.js";
 import {
   nativeSystemInstructions,
@@ -209,8 +209,8 @@ export function describeRunnerdNativeSessionBackend(
   input: NativeExecutionInput,
 ): Promise<NativeSessionBackendDescriptor> {
   if (input.schema === "paperclip.native-execution-input.v6") {
-    // Dot uses its dedicated Rust bridge, rather than the JSON-RPC facade.
-    const descriptor = describeRunnerdDotDriver();
+    // External bots use the shared Rust bridge and retain their provider identity.
+    const descriptor = describeRunnerdExternalBotDriver(input.provider.kind);
     return Promise.resolve({
       kind: "runner",
       name: descriptor.kind,

@@ -1,5 +1,7 @@
 import { idleWorkSnapshot } from "./task-admission.js";
 import { readIdleLocalWork, type IdleLocalWork } from "./idle-local-work.js";
+import { readIdleRoutineSchedule, type ScheduledWake } from "./idle-scheduled-work.js";
+import { combineIdleSchedules, readIdleIssueSchedule } from "./idle-issue-schedule.js";
 import type { Db } from "@paperclipai/db";
 import { sql } from "drizzle-orm";
 
@@ -13,8 +15,9 @@ export interface IdleSleepDrainStatus {
 }
 
 export interface IdleSleepSafety {
-  version: 1;
+  version: 1 | 2;
   backgroundWork: "none" | "present" | "unknown";
+  scheduledWake?: ScheduledWake;
 }
 
 export type InspectIdlePlugins = (hold: { ownerId: string; expiresAt: number }) => Promise<{
@@ -219,6 +222,8 @@ export async function readIdleSleepSafety(
   inspectLocalWork: () => Promise<IdleLocalWork> = readIdleLocalWork,
   inspectPlugins?: InspectIdlePlugins,
   prepareBackup?: () => Promise<boolean>,
+  scheduledRoutines = false,
+  scheduledIssueMonitors = false,
 ): Promise<IdleSleepSafety> {
   const unknown: IdleSleepSafety = { version: 1, backgroundWork: "unknown" };
   const before = getDrainStatus();
@@ -236,16 +241,34 @@ export async function readIdleSleepSafety(
       if (pluginWork.backgroundWork !== "none") return { version: 1, backgroundWork: pluginWork.backgroundWork };
       quietPlugins = pluginWork.pluginIds;
     }
+    let scheduledWake: ScheduledWake | undefined;
     const blocked = await db.transaction(async (tx) => {
       await tx.execute(sql`SET LOCAL statement_timeout = '5s'`);
-      const checks = WORK_CHECKS.map((query) => sql`EXISTS (${sql.raw(query)})`);
+      const checks = WORK_CHECKS.filter(query =>
+        (!scheduledRoutines || query !== `SELECT 1 FROM routines WHERE status NOT IN ('paused', 'archived')`)
+        && (!scheduledIssueMonitors || query !== `SELECT 1 FROM issues WHERE status NOT IN ('done', 'cancelled')`))
+        .map((query) => sql`EXISTS (${sql.raw(query)})`);
       // Only the current worker's owned runtime drain can exempt a plugin.
       // Missing workers, old SDKs, and newly installed plugins still block.
       checks.push(quietPlugins.length === 0
         ? sql`EXISTS (SELECT 1 FROM plugins WHERE status <> 'disabled')`
         : sql`EXISTS (SELECT 1 FROM plugins WHERE status <> 'disabled' AND id NOT IN (${sql.join(quietPlugins.map((id) => sql`${id}::uuid`), sql`, `)}))`);
       const rows = await tx.execute<{ blocked: boolean }>(sql`SELECT ${sql.join(checks, sql` OR `)} AS blocked`);
-      return rows.length === 1 && typeof rows[0]?.blocked === "boolean" ? rows[0].blocked : undefined;
+      if (rows.length !== 1 || typeof rows[0]?.blocked !== "boolean") return undefined;
+      if (rows[0].blocked) return true;
+      if (scheduledRoutines) {
+        if (!ownerId || ownerId !== before.ownerId) return undefined;
+        const schedule = await readIdleRoutineSchedule(tx, ownerId, now());
+        if (schedule.blocked) return true;
+        scheduledWake = schedule.scheduledWake;
+      }
+      if (scheduledIssueMonitors) {
+        if (!scheduledRoutines || !ownerId || ownerId !== before.ownerId) return undefined;
+        const schedule = await readIdleIssueSchedule(tx, ownerId, now());
+        if (schedule.blocked) return true;
+        scheduledWake = combineIdleSchedules(scheduledWake, schedule.scheduledWake);
+      }
+      return false;
     }, { isolationLevel: "repeatable read", accessMode: "read only" });
     if (blocked === undefined || !sameQuietHold(before, getDrainStatus(), now())) return unknown;
     if (blocked) return { version: 1, backgroundWork: "present" };
@@ -265,6 +288,10 @@ export async function readIdleSleepSafety(
     const localAfter = idleWorkSnapshot();
     if (!sameQuietHold(before, after, now()) || localAfter.active !== 0 ||
         expectedGeneration !== localAfter.generation) return unknown;
+    if (local === "none" && scheduledWake) {
+      if (Date.parse(scheduledWake.nextWakeAt) <= now()) return { version: 1, backgroundWork: "present" };
+      return { version: 2, backgroundWork: "none", scheduledWake };
+    }
     return { version: 1, backgroundWork: local };
 
   } catch {

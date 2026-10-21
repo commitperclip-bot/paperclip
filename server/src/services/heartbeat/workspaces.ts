@@ -59,6 +59,7 @@ import {
   type RealizedExecutionWorkspace,
 } from "../workspace-runtime.js";
 import { resolvePersistedGitWorkspaceSource } from "../persisted-workspace-source.js";
+import { verifiedRecordedIsolatedRemoteSource } from "../isolated-remote-workspace-source.js";
 import { issueService } from "../issues.js";
 import { projectService } from "../projects.js";
 import {
@@ -3339,6 +3340,7 @@ export function createHeartbeatWorkspaceResolver(db: Db) {
       repoName: deriveRepoNameFromRepoUrl(workspace.repoUrl),
     }) : null;
     const candidateBaseCwds = [
+      await verifiedRecordedIsolatedRemoteSource(workspace),
       managedBase,
       managedBase && workspace.repoUrl
         ? `${managedBase}-${createHash("sha256").update(workspace.repoUrl).digest("hex").slice(0, 12)}` : null,

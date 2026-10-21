@@ -1,4 +1,5 @@
-import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, subscribeDatabaseWork } from "@paperclipai/db";
+import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm, stat, readFile, writeFile } from "node:fs/promises";
@@ -345,13 +346,16 @@ describeEmbeddedPostgres("reopen archived isolated execution workspace", () => {
     const issueId = await seedIssue({ companyId, projectId, workspaceId, issueNumber: 4100 });
 
     const svc = executionWorkspaceService(db);
+    const events: string[] = [];
+    const unsubscribe = subscribeDatabaseWork(db, DELIVERY_QUEUES.terminalWorkspaces, event => events.push(event));
     const result = await svc.reopenClosedIsolatedExecutionWorkspaceForIssue({
       workspaceId,
       issue: { id: issueId, companyId, projectId },
       actor: { agentId: null, actorType: "user" },
       authorizationActor: { type: "board", source: "local_implicit", isInstanceAdmin: true },
-    });
+    }).finally(unsubscribe);
 
+    expect(events).toEqual(["intent", "settled"]);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.reopened).toBe(true);

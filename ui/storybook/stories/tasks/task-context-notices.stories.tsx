@@ -48,7 +48,16 @@ const meta = {
   id: "tasks-context-notices",
   title: "Tasks and conversations/Task creation and lifecycle/Tasks/Context notices",
   component: TaskContextNotices,
-  parameters: { layout: "fullscreen" },
+  parameters: { layout: "fullscreen",
+    paperclip: {
+      "capabilities": [
+        "tasks/discussion"
+      ],
+      "implementation": "production",
+      "boundary": "fixtures",
+      "notes": "The filter uses one lowercase label without helper text. All chat-channel tasks count as bot-created; the focused visibility stories cover human-initiated channel work."
+    },
+  },
 } satisfies Meta<typeof TaskContextNotices>;
 export default meta;
 type Story = StoryObj<typeof meta>;

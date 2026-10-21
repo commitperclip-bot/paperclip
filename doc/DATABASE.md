@@ -2,6 +2,80 @@
 
 Paperclip uses PostgreSQL via [Drizzle ORM](https://orm.drizzle.team/). There are three ways to run the database, from simplest to most production-ready.
 
+### Task query performance
+
+Run-context lookups use expression indexes for both `context_snapshot.issueId`
+and `context_snapshot.paperclipIssue.id`. Task creation provenance has its own
+company-scoped expression index that follows the query's native issue ID and
+legacy `issueId`/`taskId`/`taskKey` precedence. Migration 0345 builds the two new
+indexes concurrently and can resume an interrupted build without blocking run
+writes for the full build. The indexes add storage and run-write overhead; they
+do not change task visibility or secret redaction.
+
+The chat wake-notice sweep compares UUID columns directly against guarded,
+canonical lowercase UUID payload values. Malformed and noncanonical payloads
+still match nothing. The query can use existing primary keys without adding a
+wakeup-history index.
+
+To compare all three queries on the same disposable local PostgreSQL fixture:
+
+```sh
+pnpm --filter @paperclipai/server exec tsx ../scripts/benchmark-slow-queries.ts --baseline-ref=origin/master
+```
+
+Use a revision before these fixes for `--baseline-ref` after they merge. The
+benchmark loads that revision's chat query, uses synthetic data only, compares
+complete returned rows, and prints timings and `EXPLAIN (ANALYZE, BUFFERS)` plans.
+Local results measure query execution, not staging request latency.
+
+Run history defaults to 200 rows and permits at most 1,000 rows, including
+direct service calls. The UI client requests 200 rows when its caller omits a
+limit. Context summaries expand the stored JSON once per returned row, retaining
+legacy text conversion and the first-class issue binding. Authorization and
+secret redaction still run on the bounded result set.
+Agent detail links fetch an older selected run by ID when it is outside the
+history page, and verify that it belongs to the current company and agent.
+
+Saved-run policy and parent-report lookups read only the `executionPolicy`
+value or the legacy `issueId` and `taskId` values from a run context. PostgreSQL projects
+those JSON values before it sends the row to the controller. Unused prompt and
+launch context does not travel with each policy or parent-report check. JSON
+types, task-key precedence, and company and agent identity checks are preserved.
+Each decision still reads current data; this is not an authorization cache.
+
+To compare the real summary and full history queries with an earlier revision:
+
+```sh
+pnpm --filter @paperclipai/server exec tsx ../scripts/benchmark-run-history.ts --baseline-ref=1e731520bb
+```
+
+The fixture has 1,400 synthetic runs with 192 KiB contexts. Both queries return
+the same 200 complete rows. This benchmark excludes HTTP and redaction latency.
+
+Workspace reads also compare retained task IDs as guarded, canonical UUIDs.
+This lets PostgreSQL check each source task by primary key before it evaluates
+task privacy. Casting the indexed task ID to text can instead evaluate privacy
+across company history for each workspace. Repository admission repeats these
+reads while holding its company provenance lock, so that plan can delay other
+agent launches. Missing, malformed, noncanonical, and foreign-company source
+IDs still deny access.
+
+The subsequent source-task enumeration also keeps `issues.id` as a UUID. Its
+OR predicate combines the workspace binding index with the task primary key.
+Casting that ID to text forces another scan of company history even after the
+workspace privacy query has passed. The workspace authorization regression
+suite checks both plans and verifies the attached and retained source results.
+
+To compare this query on a disposable fixture with 13,429 tasks:
+
+```sh
+pnpm --filter @paperclipai/server exec tsx ../scripts/benchmark-workspace-authorization.ts --baseline-ref=5c7a025032
+```
+
+The benchmark loads the baseline authorization module with current dependencies,
+compares complete workspace rows, and prints five warm samples and query plans.
+It measures SQL execution, not the full repository admission or agent startup.
+
 ## 1. Embedded PostgreSQL — zero config
 
 If you don't set `DATABASE_URL`, the server automatically starts an embedded PostgreSQL instance and manages a local data directory.
@@ -716,7 +790,7 @@ not revoke grants used by other bots. See [Slack setup](connections/slack-setup.
 
 ## Transaction-aware delivery work signals
 
-Five existing delivery queues use process-local work signals to avoid empty
+Durable delivery queues, including plugin resource lifecycle events, use process-local work signals to avoid empty
 polling. Register work **before** writing a queue row, on that row's transaction:
 
 ```ts
@@ -756,6 +830,47 @@ register before writing, or they can remain unseen until the next startup or
 another notification. Tests should verify both the producer and its outer
 transaction boundary.
 
+### Project repository skill synchronization
+
+`project_skill_sources` stores durable workspace import jobs and originating project
+access provenance. Active bindings track their repository/ref; inactive bindings retain
+access to installed versions. Project deletion removes bindings, but retained skills
+with `access_source_id` stay restricted when no originating project remains.
+Removing a project source hides tracking using `company_skill_sources.removed_at`
+while retaining its access identity for editable copies and forks. Bindings become
+inactive and refresh leases are invalidated transactionally. Reattachment preserves
+removal; explicit adoption creates or joins an active source with a separate identity.
+Migration 0341 limits repository/ref uniqueness to active sources. Removed sources
+retain their original project audience; editable forks capture independent retained
+provenance so later attachments cannot expose their local edits. Membership and
+project visibility are still evaluated dynamically.
+
+`company_skill_sources` stores automatic-update and future-import preferences, setup
+user/agent and connection/grant IDs, next-check time, failure count and existing refresh
+leases. Existing sources default to automatic updates with their selection preserved.
+Credential values remain in the connection secret system. No project membership lists
+are copied into skills. Background publication uses normal immutable versions and
+transactional activity attribution. Setup agent and connection identifiers remain after
+those identities are deleted. Refresh then requires explicit repair; deletion cannot
+silently substitute board authority or another connection. Execution snapshots keep
+only the delivered skill keys and their immutable version IDs. New executions resolve
+the latest installed versions without an upstream fetch.
+
+Project-derived sources retain `HEAD` for an unspecified repository ref. It follows
+GitHub's current default branch. An explicitly configured branch has a separate
+source identity even if it currently resolves to that default branch. API-key
+agents without an authenticated run may attach repositories; their durable import
+jobs have no setup person and require adoption by an authorized person.
+
+Independent sources can change their tracked branch or revision through source
+settings, including `HEAD` to follow the default branch. Validate the repository
+identity and the requested commit read
+before changing the ref; preserve installed skill IDs, versions and selection. Active
+project bindings must change their ref through the project configuration. `HEAD`
+remains the default-branch alias after refresh, including for independent sources.
+Branch changes use the source revision and lease fence, reject duplicate repository/ref
+sources, keep installed version rows unchanged, and enqueue the normal refresh path.
+Branch listing uses the caller's authorized connection, not the stored setup identity.
 
 ### Task workspace records (2026-10-09)
 
@@ -766,6 +881,10 @@ Migration [0336_big_crystal.sql](../packages/db/src/migrations/0336_big_crystal.
 Migration [0337_exotic_proemial_gods.sql](../packages/db/src/migrations/0337_exotic_proemial_gods.sql) adds internal `execution_workspace_repository_roots` records. A company and hash of its canonical physical path uniquely identify a sticky `anonymous_only` or `managed` acquisition reservation. Short transactions serialize reservations with repository requests and credential promotion, preventing private publication after low-trust admission checks. Records have no workspace foreign key: mutable workspace metadata, relocation, archival or deletion cannot release a physical folder still accessible to an admitted run. There is no automatic mode change or reservation deletion.
 
 Migration [0338_absurd_vengeance.sql](../packages/db/src/migrations/0338_absurd_vengeance.sql) adds internal `execution_workspace_repository_access` provenance. Company/canonical-root source entries retain execution-workspace and source-project identities; reader entries retain the exact admitted run, task, agent and responsible user. New repository receipts also record their root at creation; legacy receipts receive no inferred origin. Shared project-source entries retain which physical owners require workspace write authority. Current admission, selection, requests and publication check the current task’s writer against those owners; retained past readers and file APIs still require only read authority. Genuine isolated copies retain source read access without requiring shared-folder write access. An existing linked worktree can recover a missing isolated-copy proof only after Git registration and its captured source owner are verified. Configured local sibling copies retain deny-only task/project source ownership on the bound task root before materialization; ordinary repository clones create no isolation proof. The shared root fence checks every reader against every source before admission and future publication, including tasks without repository requests. File APIs apply the same source privacy without writing provenance. These entries grant no authority and have no workspace or run deletion cascade; unavailable retained identity fails closed. Automatic provenance release is deferred, so a newly incompatible permission scope requires a separate physical root.
+
+Repository admission loads retained workspace and task sources in bounded batches. Readers share source rows and privacy evaluation for identical principals, but each retained run receives its own trust and responsible-user decision. The snapshot lasts only for one read batch; later admission and publication reload current authority. Keep source-loading query counts bounded as both workspace history and retained reader counts grow.
+
+Each physical-root scan resolves duplicate workspace paths once, with bounded concurrency for distinct paths. Alias results are discarded after that scan so later admission and publication recheck symlink targets. Provenance identities select overlapping root records through the company/root index; source retention writes use bounded batches under the existing company lock, including deny-only ownership retained after a failed copy authorization.
 
 Git-source capture checks the actual common Git storage directory and verified
 checkout owners. Separately stored metadata does not make its parent a checkout.
@@ -800,3 +919,34 @@ source captures leave no new records. Worktree realization uses a verified check
 as its Git command directory, including when metadata sits inside another repository.
 
 No migration scans or copies existing agent home directories. Keep admitted native descriptors and recovery references until compatible controllers finish their persistence obligations. See [the architecture rollout contract](plans/2026-10-09-task-workspaces.md).
+
+Migration 0341 stores the last scanned Git tree and a durable automatic-refresh
+work allowance. The allowance starts at 512 MiB, refills at 512 MiB/hour, and
+reserves the existing 128 MiB upper bound before automatic downloads. Completed
+small scans refund unused capacity; interrupted/failed work keeps its bounded
+reservation. These internal fields do not appear in source responses.
+
+Automatic initial repository imports reserve durable company work credits before
+provider reads: 512 MiB capacity, refilling 512 MiB per hour, with a 128 MiB
+reservation per attempt. Failed downloads and package fallback keep the full
+reservation. Successfully linked small imports refund unused measured work.
+Completed bindings do not reset company credits; waiting jobs retry on refill.
+The company_skill_import_budgets table stores no credentials or source contents.
+
+### Execution recovery query performance
+
+Conversation recovery keeps indexed run and task UUID columns as UUIDs. Saved
+JSON identifiers pass a canonical lowercase UUID guard before conversion.
+Malformed, uppercase, numeric and cross-company values retain their old behavior.
+Ownership candidate reads split native and legacy issue bindings so existing
+indexes can filter candidates before reading large contexts. Native bindings
+continue to override legacy context IDs. No new index or migration is needed.
+
+```sh
+pnpm --filter @paperclipai/server exec tsx ../scripts/benchmark-recovery-queries.ts --baseline-ref=1e731520bb
+```
+
+This disposable fixture compares the real ownership, recovery-action and status
+delivery queries, including complete positional results and database plans.
+All data is synthetic. Query timings exclude process liveness probes, HTTP and
+provider work.

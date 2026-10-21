@@ -62,6 +62,7 @@ import type { RunFailureDiagnostics } from "./services/run-failure-diagnostics.j
 import { readBuildCommit } from "./build-commit.js";
 import { checkExactPeerVersions } from "./peer-version-check.js";
 import { resolveSentryDsns } from "./sentry-dsn.js";
+import { readRunFailureReportingMode } from "./sentry-run-failure-policy.js";
 
 const { backend: dsn, legacyFallbackUsed } = resolveSentryDsns();
 
@@ -142,8 +143,9 @@ export type RunFailureStatus = "failed" | "timed_out" | "cancelled";
  * event. `errorCode` is `null` when the run holds no error code.
  */
 export interface RunFailureEvent {
-  /** The task UUID the run belongs to. */
-  taskId: string;
+  taskId: string | null;
+  companyId?: string;
+  agentId?: string;
   /** The `heartbeat_runs` row id. */
   runId: string;
   /** The redacted error message. */
@@ -185,13 +187,9 @@ function normalizeRunSignal(value: unknown): string | null {
  * or when the gate never opens. Never throws — observability must not
  * change run control flow.
  *
- * Sets the fingerprint to `[errorCode, agentAdapter]`, in that order, so
- * Sentry groups events by error code and adapter. The error message stays
- * out of the fingerprint — it still travels as the exception message and as
- * a field of the `run_failure` context.
  */
 export function captureRunFailure(event: RunFailureEvent): void {
-  if (!sentryHandle) return;
+  if (!sentryHandle || readRunFailureReportingMode() === "off") return;
   const handle = sentryHandle;
   try {
     const errorCode = event.errorCode ?? "unknown";
@@ -199,7 +197,34 @@ export function captureRunFailure(event: RunFailureEvent): void {
     // A withScope mutation can then persist into unrelated later captures.
     // Pass these fields on this event only; do not mutate the ambient scope.
     const diagnostics = event.diagnostics;
+    const rootCodeCandidate = diagnostics?.execution.originalFailureCode ??
+      diagnostics?.exceptions.at(-1)?.code;
+    const rootErrorCode = typeof rootCodeCandidate === "string" && /^[a-zA-Z][a-zA-Z0-9_]{1,99}$/.test(rootCodeCandidate)
+      ? rootCodeCandidate : undefined;
+    const phase = diagnostics?.execution.failurePhase;
+    const failurePhase = phase === "setup" || phase === "execute" ? phase : undefined;
     const contexts: Record<string, Record<string, unknown>> = {};
+    if (event.companyId && event.agentId) {
+      const runPath = `/api/heartbeat-runs/${encodeURIComponent(event.runId)}`;
+      contexts.paperclip = {
+        schemaVersion: 1,
+        companyId: event.companyId,
+        agentId: event.agentId,
+        runPath,
+        eventsPath: `${runPath}/events`,
+        logPath: `${runPath}/log`,
+        ...(event.taskId ? { taskPath: `/api/issues/${encodeURIComponent(event.taskId)}` } : {}),
+      };
+      try {
+        const base = new URL(process.env.PAPERCLIP_PUBLIC_URL ?? "");
+        if ((base.protocol === "https:" || base.protocol === "http:") &&
+            !base.username && !base.password && !base.search && !base.hash && base.pathname === "/") {
+          contexts.paperclip.runUrl = new URL(runPath, base).href;
+          contexts.paperclip.eventsUrl = new URL(`${runPath}/events`, base).href;
+          contexts.paperclip.logUrl = new URL(`${runPath}/log`, base).href;
+        }
+      } catch {}
+    }
     if (diagnostics) {
       contexts.run_execution = { ...diagnostics.execution, truncatedFields: diagnostics.truncatedFields };
       if (Object.keys(diagnostics.adapter).length) contexts.adapter_failure = diagnostics.adapter;
@@ -226,8 +251,13 @@ export function captureRunFailure(event: RunFailureEvent): void {
     }
     handle.captureException(exception, {
       tags: {
+        event_kind: "run_failure",
+        ...(rootErrorCode ? { root_error_code: rootErrorCode } : {}),
+        ...(failurePhase ? { failure_phase: failurePhase } : {}),
         run_id: event.runId,
-        task_id: event.taskId,
+        ...(event.taskId ? { task_id: event.taskId } : {}),
+        ...(event.companyId ? { company_id: event.companyId } : {}),
+        ...(event.agentId ? { agent_id: event.agentId } : {}),
         error_code: errorCode,
         agent_adapter: event.agentAdapter,
         run_status: event.runStatus,
@@ -244,7 +274,7 @@ export function captureRunFailure(event: RunFailureEvent): void {
           signal: normalizeRunSignal(event.signal),
         },
       },
-      fingerprint: [errorCode, event.agentAdapter],
+      fingerprint: [errorCode, event.agentAdapter, ...(failurePhase ? [failurePhase] : []), ...(rootErrorCode ? [rootErrorCode] : [])],
     });
   } catch (err) {
     // eslint-disable-next-line no-console

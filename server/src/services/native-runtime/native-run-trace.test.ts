@@ -444,3 +444,29 @@ describe("native runner performance trace", () => {
     ).toBe(true);
   });
 });
+
+it.each(["start", "context", "attribute", "status", "end"])("keeps execution and cleanup independent of a throwing %s tracer method", async broken => {
+  const failure = new Error("original private execution failure");
+  const spans: Array<{ end: ReturnType<typeof vi.fn> }> = [];
+  const traceContext: StartupTraceContextHandle = {
+    tracer: { startSpan() {
+      if (broken === "start") throw new Error("tracer failed");
+      const span = {
+        setAttribute() { if (broken === "attribute") throw new Error("attribute failed"); },
+        setStatus() { if (broken === "status") throw new Error("status failed"); },
+        end: vi.fn(() => { if (broken === "end") throw new Error("end failed"); }),
+      };
+      spans.push(span);
+      return span;
+    } },
+    contextWithSpan() { if (broken === "context") throw new Error("context failed"); return undefined; },
+  };
+  const native = createNativeRunTrace({ runId: "throwing-tracer", traceContext });
+  const result = {}, work = vi.fn(async () => result), failedWork = vi.fn(async () => { throw failure; });
+  await expect(native.measure("runner.turn.submit", work)).resolves.toBe(result);
+  await expect(native.measure("agent.turn", failedWork)).rejects.toBe(failure);
+  await expect(native.finish("failed")).resolves.toBeUndefined();
+  expect(work).toHaveBeenCalledOnce();
+  expect(failedWork).toHaveBeenCalledOnce();
+  for (const span of spans) expect(span.end).toHaveBeenCalledOnce();
+});

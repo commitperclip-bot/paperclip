@@ -167,7 +167,14 @@ vi.mock("./MarkdownEditor", () => ({
 }));
 
 vi.mock("./InlineEntitySelector", () => ({
-  InlineEntitySelector: () => null,
+  InlineEntitySelector: ({ value, onChange }: { value: string; onChange: (value: string) => void }) => (
+    <select aria-label="Test recipient" value={value} onChange={(event) => onChange(event.target.value)}>
+      <option value="agent:first">First agent</option>
+      <option value="agent:latest">Latest agent</option>
+      <option value="user:me">Me</option>
+      <option value="">No responsible</option>
+    </select>
+  ),
 }));
 
 vi.mock("./Identity", () => ({
@@ -375,6 +382,33 @@ function createFileDragEvent(type: string, files: File[]) {
 describe("IssueChatThread", () => {
   let container: HTMLDivElement;
 
+  it("updates automatic suggestions but preserves manual choices until the task changes", () => {
+    const root = createRoot(container);
+    const render = (suggestion: string, draftKey = "task-one") => act(() => root.render(
+      <MemoryRouter>
+        <IssueChatThread comments={[]} onAdd={async () => {}} enableReassign
+          reassignOptions={[{ id: "agent:first", label: "First agent" }]}
+          currentAssigneeValue="user:me" suggestedAssigneeValue={suggestion} draftKey={draftKey} enableLiveTranscriptPolling={false} />
+      </MemoryRouter>,
+    ));
+    const selector = () => container.querySelector('select[aria-label="Test recipient"]') as HTMLSelectElement;
+    render("agent:first");
+    expect(selector().value).toBe("agent:first");
+    render("agent:latest");
+    expect(selector().value).toBe("agent:latest");
+    for (const manual of ["user:me", ""]) {
+      act(() => {
+        selector().value = manual;
+        selector().dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      render("agent:first");
+      render("agent:latest");
+      expect(selector().value).toBe(manual);
+    }
+    render("agent:first", "task-two");
+    expect(selector().value).toBe("agent:first");
+    act(() => root.unmount());
+  });
   function renderIssueThread(root: ReturnType<typeof createRoot>, props: Partial<ComponentProps<typeof IssueChatThread>> = {}) {
     root.render(
       <MemoryRouter>
@@ -418,6 +452,11 @@ describe("IssueChatThread", () => {
         showComposer: false,
       });
     });
+
+    const spacer = container.querySelector(
+      '[data-testid="issue-chat-bottom-spacer"]',
+    );
+    expect(spacer).toBeNull();
 
     expect(container.textContent).toContain("Jump to latest");
     expect(container.textContent).not.toContain("Chat (");
@@ -1176,56 +1215,6 @@ describe("IssueChatThread", () => {
 
   // PAP-12003: initial page load must not jump to the latest comment. If a
   // user wants the newest message, the explicit Jump to latest control owns it.
-  it("does not auto-scroll to the latest comment on initial load", () => {
-    vi.useFakeTimers();
-    container.remove();
-    const scrollHost = document.createElement("main");
-    scrollHost.id = "main-content";
-    scrollHost.style.overflowY = "auto";
-    scrollHost.style.overflow = "auto";
-    scrollHost.style.height = "640px";
-    document.body.appendChild(scrollHost);
-    container = document.createElement("div");
-    scrollHost.appendChild(container);
-
-    const elementScrollToMock = vi.fn();
-    scrollHost.scrollTo =
-      elementScrollToMock as unknown as typeof scrollHost.scrollTo;
-    const originalScrollIntoView = Element.prototype.scrollIntoView;
-    const scrollIntoViewMock = vi.fn();
-    Element.prototype.scrollIntoView =
-      scrollIntoViewMock as unknown as typeof Element.prototype.scrollIntoView;
-
-    const root = createRoot(container);
-    act(() => {
-      renderIssueThread(root, {
-        comments: issueChatLongThreadComments,
-        linkedRuns: issueChatLongThreadLinkedRuns,
-        timelineEvents: issueChatLongThreadEvents,
-        agentMap: issueChatLongThreadAgentMap,
-        currentUserId: "user-board",
-        transcriptsByRunId: issueChatLongThreadTranscriptsByRunId,
-        hasOutputForRun: (runId) =>
-          issueChatLongThreadTranscriptsByRunId.has(runId),
-      });
-    });
-
-    // No jump click: initial render should preserve the page position.
-    act(() => {
-      vi.advanceTimersByTime(500);
-    });
-
-    expect(elementScrollToMock).not.toHaveBeenCalled();
-    expect(scrollIntoViewMock).not.toHaveBeenCalled();
-
-    Element.prototype.scrollIntoView = originalScrollIntoView;
-    act(() => {
-      root.unmount();
-    });
-    scrollHost.remove();
-    vi.useRealTimers();
-  });
-
   it("can keep the page at the top on initial load while preserving manual jump-to-latest", () => {
     vi.useFakeTimers();
     container.remove();
@@ -3158,42 +3147,6 @@ describe("IssueChatThread", () => {
     });
   });
 
-  it("keeps the composer floating with a capped editor height", () => {
-    const root = createRoot(container);
-
-    act(() => {
-      renderIssueThread(root);
-    });
-
-    const dock = container.querySelector(
-      '[data-testid="issue-chat-composer-dock"]',
-    ) as HTMLDivElement | null;
-    expect(dock).not.toBeNull();
-    expect(dock?.className).toContain("sticky");
-    expect(dock?.className).toContain("bottom-(--sz-calc-8)");
-    expect(dock?.className).toContain("z-20");
-
-    const composer = container.querySelector(
-      '[data-testid="issue-chat-composer"]',
-    ) as HTMLDivElement | null;
-    expect(composer).not.toBeNull();
-    expect(composer?.className).toContain("rounded-md");
-    expect(composer?.className).not.toContain("rounded-lg");
-    expect(composer?.className).toContain("p-(--sz-15px)");
-
-    const editor = container.querySelector(
-      'textarea[aria-label="Issue chat editor"]',
-    ) as HTMLTextAreaElement | null;
-    expect(editor?.dataset.contentClassName).toContain("max-h-(--sz-28dvh)");
-    expect(editor?.dataset.contentClassName).toContain("overflow-y-auto");
-    expect(editor?.dataset.contentClassName).not.toContain("min-h-(--sz-72px)");
-    expect(editor?.dataset.fileDropTarget).toBe("parent");
-
-    act(() => {
-      root.unmount();
-    });
-  });
-
   it("shows full-composer drop instructions while dragging files over the issue composer", () => {
     const root = createRoot(container);
 
@@ -3695,25 +3648,6 @@ describe("IssueChatThread", () => {
     });
   });
 
-  it("omits the bottom spacer when the composer is hidden", () => {
-    const root = createRoot(container);
-
-    act(() => {
-      renderIssueThread(root, {
-        showComposer: false,
-      });
-    });
-
-    const spacer = container.querySelector(
-      '[data-testid="issue-chat-bottom-spacer"]',
-    );
-    expect(spacer).toBeNull();
-
-    act(() => {
-      root.unmount();
-    });
-  });
-
   it("hides the reopen control and infers reopen for closed agent-assigned issue replies", async () => {
     const root = createRoot(container);
     const onAdd = vi.fn().mockResolvedValue(undefined);
@@ -4031,6 +3965,30 @@ describe("IssueChatThread", () => {
     act(() => {
       renderIssueThread(root);
     });
+
+    const dock = container.querySelector(
+      '[data-testid="issue-chat-composer-dock"]',
+    ) as HTMLDivElement | null;
+    expect(dock).not.toBeNull();
+    expect(dock?.className).toContain("sticky");
+    expect(dock?.className).toContain("bottom-(--sz-calc-8)");
+    expect(dock?.className).toContain("z-20");
+
+    const composer = container.querySelector(
+      '[data-testid="issue-chat-composer"]',
+    ) as HTMLDivElement | null;
+    expect(composer).not.toBeNull();
+    expect(composer?.className).toContain("rounded-md");
+    expect(composer?.className).not.toContain("rounded-lg");
+    expect(composer?.className).toContain("p-(--sz-15px)");
+
+    const editor = container.querySelector(
+      'textarea[aria-label="Issue chat editor"]',
+    ) as HTMLTextAreaElement | null;
+    expect(editor?.dataset.contentClassName).toContain("max-h-(--sz-28dvh)");
+    expect(editor?.dataset.contentClassName).toContain("overflow-y-auto");
+    expect(editor?.dataset.contentClassName).not.toContain("min-h-(--sz-72px)");
+    expect(editor?.dataset.fileDropTarget).toBe("parent");
 
     act(() => {
       renderIssueThread(root, {

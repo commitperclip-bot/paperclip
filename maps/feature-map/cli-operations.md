@@ -1,4 +1,8 @@
-# CLI, API clients, and local worktrees
+---
+navigation: {"section":"Oversight and operation","sectionOrder":70,"order":50}
+---
+
+# CLI/API and local worktrees
 
 Operators and agents can work through explicit CLI/API context, manage domain resources, inspect runs, and create isolated local worktree instances for development.
 
@@ -60,3 +64,40 @@ Manual: Initialize an owned disposable worktree instance, inspect its printed pa
 - API success proves its contract, not the equivalent browser creation journey.
 - The CLI command registry is broader than the UI page inventory; new command families need a recipe review.
 - See [instance operations](./instance-operations.md) for install/update/backup and feature-specific recipes for domain behavior.
+
+### Storybook verification
+
+#### `context`
+
+Scope: cli
+Storybook: No authored story required for CLI profile/context selection.
+Production: Verify selected API origin, identity and company, JSON output and invalid-token/wrong-company failures. A persona label is not authentication.
+Sources: Source: [context.ts](../../cli/src/commands/client/context.ts). Tests: [context.test.ts](../../cli/src/__tests__/context.test.ts), [http.test.ts](../../cli/src/__tests__/http.test.ts)
+
+#### `domain-commands`
+
+Scope: cli
+Storybook: No authored story required for command parsing and domain API execution; corresponding product UI keeps its own story needs.
+Production: Discover registered help, use a disposable company, assert persisted mutations and denied operations with the actual actor. Command parity is not every endpoint passing live.
+Sources: Source: [index.ts](../../cli/src/index.ts), [issue.ts](../../cli/src/commands/client/issue.ts). Tests: [operations-parity.test.ts](../../cli/src/__tests__/operations-parity.test.ts)
+
+#### `outputs`
+
+Scope: cli
+Storybook: No authored story required for CLI document/asset/skill IO or machine-readable output.
+Production: Assert payload/schema, exit code, written contents, authorization and file integrity. Open the resulting document/asset in the product for cross-surface acceptance.
+Sources: Source: [issue.ts](../../cli/src/commands/client/issue.ts), [asset.ts](../../cli/src/commands/client/asset.ts), [skill.ts](../../cli/src/commands/client/skill.ts). Tests: [issue-subresources.test.ts](../../cli/src/__tests__/issue-subresources.test.ts), [admin-asset-skill-parity.test.ts](../../cli/src/__tests__/admin-asset-skill-parity.test.ts)
+
+#### `run-controls`
+
+Scope: cli
+Storybook: No authored story required for invoke/list/get/cancel/events/log command execution.
+Production: Assert the real run ID, event/log output and resulting state, eligible actor and cancellation denial. Printed success does not prove provider completion.
+Sources: Source: [run.ts](../../cli/src/commands/client/run.ts), [heartbeat-run.ts](../../cli/src/commands/heartbeat-run.ts). Tests: [operations-parity.test.ts](../../cli/src/__tests__/operations-parity.test.ts)
+
+#### `worktree-instances`
+
+Scope: cli
+Storybook: No authored story required for worktree initialize/seed/repair/cleanup commands.
+Production: Use only an owned isolated checkout/instance; verify paths, ports, health, login and seed provenance, then cleanup ownership. Capture evidence before teardown.
+Sources: Source: [worktree.ts](../../cli/src/commands/worktree.ts), [test-drive.ts](../../cli/src/commands/test-drive.ts). Tests: [worktree.test.ts](../../cli/src/__tests__/worktree.test.ts), [test-drive.test.ts](../../cli/src/__tests__/test-drive.test.ts)

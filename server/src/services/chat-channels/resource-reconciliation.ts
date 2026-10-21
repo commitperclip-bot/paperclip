@@ -508,7 +508,7 @@ export function createChatResourceReconciliation(db: Db, options: ResourceReconc
                     : currentEndpoint.status === "attention"
                       ? "verifying"
                       : currentEndpoint.status;
-                if (status !== currentEndpoint.status) await notifyChatEndpointWork(tx);
+                if (status !== currentEndpoint.status) await notifyChatEndpointWork(tx, currentEndpoint.connectionId);
                 await tx
                   .update(chatEndpoints)
                   .set({

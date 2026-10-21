@@ -1439,6 +1439,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   runtimeRootDir?: string;
   syncWorkspace?: boolean;
   workspaceInboundMode?: WorkspaceInboundMode;
+  workspaceSnapshotIsolation?: "worker";
   workspaceDurableSeed?: WorkspaceDurableSeedPaths;
   workspaceCheckpoint?: boolean;
   onWorkspaceCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
@@ -1533,6 +1534,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
     runtimeRootDir: input.runtimeRootDir,
     syncWorkspace: input.syncWorkspace,
     workspaceInboundMode: input.workspaceInboundMode,
+    workspaceSnapshotIsolation: input.workspaceSnapshotIsolation,
     workspaceDurableSeed: input.workspaceDurableSeed,
     workspaceCheckpoint: input.workspaceCheckpoint,
     onWorkspaceCheckpoint: input.onWorkspaceCheckpoint,
@@ -1768,14 +1770,19 @@ export async function prepareGitHubOperationLaunchers(input: {
   ]);
   if (remote) {
     const runner = adapterExecutionTargetCommandRunner(remote);
-    for (const [program, body] of Object.entries(files)) {
-      await syncRemoteTextFileWithHashSkip({
-        runner, remoteCwd: remote.remoteCwd, remoteDir: directory,
-        remotePath: path.posix.join(directory, program), body,
-        label: "GitHub operation launcher", action: "stage GitHub operation launcher",
-        lockDir: path.posix.join(directory, `.${program}.lock`),
-        timeoutMs: 15_000, shellCommand: adapterExecutionTargetShellCommand(remote),
-      });
+    const entries = Object.entries(files);
+    const width = runner.allowConcurrentSyncOperations === true ? 3 : 1;
+    for (let offset = 0; offset < entries.length; offset += width) {
+      const results = await Promise.allSettled(entries.slice(offset, offset + width).map(([program, body]) =>
+        syncRemoteTextFileWithHashSkip({
+          runner, remoteCwd: remote.remoteCwd, remoteDir: directory,
+          remotePath: path.posix.join(directory, program), body,
+          label: "GitHub operation launcher", action: "stage GitHub operation launcher",
+          lockDir: path.posix.join(directory, `.${program}.lock`),
+          timeoutMs: 15_000, shellCommand: adapterExecutionTargetShellCommand(remote),
+        })));
+      const failure = results.find((result) => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
     }
     const permissions = await runner.execute({ command: "sh", args: ["-c", `chmod 700 ${shellQuote(directory)}/git ${shellQuote(directory)}/gh && mkdir -p ${shellQuote(configDirectory)}`], cwd: remote.remoteCwd, timeoutMs: 15_000 });
     if (permissions.exitCode !== 0) throw new Error("Could not prepare managed GitHub launchers");

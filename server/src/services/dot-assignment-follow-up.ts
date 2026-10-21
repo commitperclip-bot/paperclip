@@ -38,6 +38,8 @@ export async function publishActiveDotComment(db: Db, input: {
   const [item] = await db.select({ references: dotMailboxItems.references }).from(dotMailboxItems).where(and(
     eq(dotMailboxItems.bindingId, binding.id), eq(dotMailboxItems.bindingGeneration, binding.generation),
     eq(dotMailboxItems.sourceEventId, `dot-follow-up:${assignment.id}:${input.commentId}`)));
+  // The Grok dispatcher observes this committed mailbox entry. Notification
+  // uncertainty must not roll back the comment's durable deferred wake.
   return { assignmentId: assignment.id, consumed: item?.references.consumed === true };
 }
 

@@ -1,5 +1,7 @@
 import { digestPaperclipSemanticContent } from "../semantic-tools/receipts.js";
 
+export type ExternalBotProviderKind = "openai_dot" | "grok_bot";
+export const GROK_BRIDGE_REVISION = "grok-bot-mcp-v1" as const;
 export const DOT_BRIDGE_REVISION = "dot-mcp-v1" as const;
 export interface DotBindingSnapshot {
   bindingId: string;

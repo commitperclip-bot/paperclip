@@ -187,7 +187,7 @@ export async function slackEndpointCandidates(
   binding: Pick<SlackTaskBinding, "companyId" | "agentId" | "endpointId">,
 ) {
   return db
-    .select({ id: chatEndpoints.id })
+    .select({ id: chatEndpoints.id, connectionId: chatEndpoints.connectionId })
     .from(chatEndpoints)
     .where(
       and(

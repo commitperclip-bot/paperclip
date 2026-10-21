@@ -5,7 +5,15 @@ const meta: Meta<typeof CloudAccessError> = {
   id: "app-connection-recovery",
   title: "Projects and execution/Recovery/App/Connection recovery",
   component: CloudAccessError,
-  parameters: { layout: "fullscreen" },
+  parameters: { layout: "fullscreen",
+    paperclip: {
+      "capabilities": [
+        "recovery/reconnect"
+      ],
+      "implementation": "production",
+      "boundary": "fixtures"
+    },
+  },
   args: { temporary: true, retrying: false, onRetry: () => undefined },
 };
 

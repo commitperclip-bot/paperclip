@@ -1,3 +1,7 @@
+---
+navigation: {"section":"Automation and structured work","sectionOrder":60,"order":20}
+---
+
 # Pipelines, review queues, and learnings
 
 With the pipeline experiment enabled, people move structured work through configured stages, inspect stage automation, review outputs, and retain learning records.
@@ -48,3 +52,33 @@ Manual: Open a pending review, inspect its source output and revision, accept or
 - These routes are experimental and may redirect or deny access when disabled.
 - ReviewQueue and Learnings are hosted from the pipeline module; a page-file inventory alone misses them.
 - Pipeline items and free-standing [cases](./cases.md) share records but have different navigation contexts.
+
+### Storybook verification
+
+#### `stages`
+
+Scope: ui
+Storybook: Mount PipelineSettings ordered stages, automation assignees/env, invalid transitions, unsaved state, saving and failed save.
+Production: POST/PATCH stages and PUT /pipelines/{id}/transitions must persist valid order/configuration, enforce ownership and reject invalid transitions; actual automation execution remains separate.
+Sources: Source: [PipelineSettings.tsx](../../ui/src/pages/PipelineSettings.tsx), [pipelines.ts](../../server/src/routes/pipelines.ts). Tests: [PipelineSettings.test.ts](../../ui/src/pages/PipelineSettings.test.ts), [pipelines-service.test.ts](../../server/src/__tests__/pipelines-service.test.ts), [pipelines-routes.test.ts](../../server/src/__tests__/pipelines-routes.test.ts)
+
+#### `items`
+
+Scope: ui
+Storybook: Mount Pipelines/PipelineItemDetailView board grouping, item creation/details, stage/health/work references, empty/loading and failed transition.
+Production: GET/POST /pipelines/{id}/cases and POST /cases/{id}/transition must maintain company scope, valid stage changes and linked work; fixture stage state does not prove automation.
+Sources: Source: [Pipelines.tsx](../../ui/src/pages/Pipelines.tsx), [PipelineWorkReferences.tsx](../../ui/src/components/PipelineWorkReferences.tsx), [pipelines.ts](../../server/src/routes/pipelines.ts). Tests: [Pipelines.test.tsx](../../ui/src/pages/Pipelines.test.tsx), [pipelines-service.test.ts](../../server/src/__tests__/pipelines-service.test.ts), [pipelines-routes.test.ts](../../server/src/__tests__/pipelines-routes.test.ts), [pipelines-tutorial-flow.spec.ts](../../tests/e2e/pipelines-tutorial-flow.spec.ts)
+
+#### `review`
+
+Scope: ui
+Storybook: Mount ReviewQueue and item review pending output/revision, accept/reject/request-changes, bulk selection, stale/conflicting submission and errors.
+Production: POST /cases/{id}/review and /companies/{id}/review-cases/bulk must authorize reviewer, persist correct outcome/transition and reject stale or invalid input.
+Sources: Source: [Pipelines.tsx](../../ui/src/pages/Pipelines.tsx), [pipelines.ts](../../server/src/routes/pipelines.ts). Tests: [Pipelines.test.tsx](../../ui/src/pages/Pipelines.test.tsx), [pipelines-routes.test.ts](../../server/src/__tests__/pipelines-routes.test.ts), [pipelines-service.test.ts](../../server/src/__tests__/pipelines-service.test.ts), [pipelines-tutorial-flow.spec.ts](../../tests/e2e/pipelines-tutorial-flow.spec.ts)
+
+#### `learnings`
+
+Scope: ui
+Storybook: Mount actual Learnings export with filtered case events, review/forced-move entries, source links, empty/loading/error. This is event history, not a separately authored learning-record system.
+Production: GET /companies/{id}/case-events in pipelines routes needs existing company/access contract tests; a rendered event cannot establish learning quality.
+Sources: Source: [Pipelines.tsx](../../ui/src/pages/Pipelines.tsx), [pipeline-learnings.ts](../../ui/src/lib/pipeline-learnings.ts), [pipelines.ts](../../server/src/routes/pipelines.ts). Tests: [Pipelines.test.tsx](../../ui/src/pages/Pipelines.test.tsx), [pipelines-routes.test.ts](../../server/src/__tests__/pipelines-routes.test.ts), [pipelines-service.test.ts](../../server/src/__tests__/pipelines-service.test.ts)

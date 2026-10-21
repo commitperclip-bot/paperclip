@@ -1,3 +1,4 @@
+import { enqueueProjectSkillSource, detachProjectSkillSource } from "./project-skill-source-bindings.js";
 import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -41,7 +42,7 @@ import { lockExecutionWorkspaceRootProvenance, preserveConfiguredProjectWorkspac
 
 type ProjectTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
-async function lockProjectRootMutation(tx: ProjectTransaction, projectId: string) {
+export async function lockProjectRootMutation(tx: ProjectTransaction, projectId: string) {
   const [identity] = await tx.select({ companyId: projects.companyId }).from(projects).where(eq(projects.id, projectId));
   if (!identity) return null;
   await lockExecutionWorkspaceRootProvenance(tx, identity.companyId);
@@ -1073,6 +1074,7 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
       if (retained) throw conflict("This project still supplies access policy for retained task workspaces. Archive the project or explicitly clean up its workspaces before deleting it.");
       const workspaces = await tx.select().from(projectWorkspaces).where(eq(projectWorkspaces.projectId, id)).for("update");
       for (const workspace of workspaces) await preserveConfiguredProjectWorkspaceRootProvenance(tx, workspace);
+      await recordProjectLifecycleEvent(tx as unknown as Db, project.companyId, id, "delete");
       const [row] = await tx.delete(projects).where(eq(projects.id, id)).returning();
       return row ? { ...row, urlKey: deriveProjectUrlKey(row.name, row.id) } : null;
     }),
@@ -1173,6 +1175,7 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
           })
           .returning()
           .then((rows) => rows[0] ?? null);
+        if (row) await enqueueProjectSkillSource(tx as unknown as Db, row);
         return row;
       });
 
@@ -1284,6 +1287,9 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
           .returning()
           .then((rows) => rows[0] ?? null);
         if (!row) return null;
+        if (row.repoUrl !== existing.repoUrl || row.defaultRef !== existing.defaultRef || row.repoRef !== existing.repoRef) {
+          await enqueueProjectSkillSource(tx as unknown as Db, row);
+        }
 
         if (row.isPrimary) return row;
 
@@ -1363,6 +1369,7 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
 
       await preserveConfiguredProjectWorkspaceRootProvenance(tx, existing);
       const removed = await db.transaction(async (tx) => {
+        await detachProjectSkillSource(tx as unknown as Db, existing.companyId, workspaceId);
         const row = await tx
           .delete(projectWorkspaces)
           .where(eq(projectWorkspaces.id, workspaceId))

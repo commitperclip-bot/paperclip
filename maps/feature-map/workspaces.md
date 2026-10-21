@@ -1,4 +1,8 @@
-# Execution workspaces, services, and files
+---
+navigation: {"section":"Projects and execution","sectionOrder":40,"order":30}
+---
+
+# Workspaces, services, and files
 
 A project or task can use a managed workspace with inspectable files, Git state, services, and runtime controls. Operators can follow its lifecycle through provisioning, use, and closure.
 
@@ -34,6 +38,34 @@ Automated: [workspace card](../../ui/src/components/IssueWorkspaceCard.test.tsx)
 
 Manual: Run a task that writes a small file, follow the bound workspace, and inspect the file and revision. Reload and verify links still refer to the same workspace, not another checkout or a stale run.
 
+For fresh standard-trust tasks using an implicit repository default, create a
+disposable project checkout whose shared Git storage overlaps a private task
+workspace. Verify that source admission creates a separate checkout from the
+configured remote, with no private local branches, commits or shared Git storage.
+Reusing, closing and reopening that task must retain the company/task-bound source;
+a failed workspace save must clean up only its owned checkout. Explicit workspace,
+parent/channel selections, literal or task-independent branch templates, low-trust
+tasks, and local or credential-bearing remote
+URLs must not use this fallback. A selected checkout requires recorded default
+provenance. Create tasks
+through the task service with an explicit checkout ID or an inherited parent
+source but no typed selection; verify denial, no clone or environment acquisition,
+and preservation of unpublished branch commits. Older ambiguous bindings and
+source choices changed during preparation must retain the denial. The
+[remote-source tests](../../server/src/services/isolated-remote-workspace-source.test.ts)
+and [preparation tests](../../server/src/services/heartbeat/workspace-preparation.test.ts)
+exercise the real Git isolation and lifecycle guards. They do not qualify live
+remote credentials or a provider deployment.
+
+For reconstructable Git expiration, finish a disposable task tree, run the
+internal lifecycle sweep after its 24-hour grace, and inspect candidate/reclaimed
+bytes. Advance its upstream first; use the ordinary task/workspace reopen control
+and verify the original commit, file contents, and subsequent persisted work.
+Current runs, previews, recovery, unique files and shared base clones must stay.
+The [expiration tests](../../server/src/__tests__/git-workspace-expiration.test.ts)
+exercise real local Git and database paths, interruption and concurrent reopening;
+cloud credentials and the deployed user journey require separate live evidence.
+
 For task workspace selection, use the authorized task workspace API to choose a
 task directory, project source, or existing workspace. Verify that a change
 made during a run stays pending until the next normal admission. Submit another
@@ -67,6 +99,12 @@ SSH keeps its explicit remote provision-command path; these checks
 do not claim a new sandbox provision transport.
 Low-trust closed-worktree reopening, including a board-comment reopen of a projectless task, must also suppress both kinds of host provision script. Returned checkpoints must reject file, symlink or missing parents before host writes, even if a nested file is marked unchanged. The retained host file and recovery evidence must survive rejection. These are automated safety contracts, not new live runtime acceptance.
 
+An unchanged returned snapshot skips the host scan after acquiring the writer lock
+and checking authority. Concurrent host edits remain untouched; changed files,
+modes, symlinks and deletions still take the conflict path. The
+[unchanged restore regression](../../packages/adapter-utils/src/workspace-restore-unchanged.test.ts)
+checks both hooks under the lock. This is source-level coverage, not a cloud latency result.
+
 For a child created by an admitted agent with an explicit existing workspace, verify that a matching sandbox boundary permits creation before the child has an ID. A changed child policy, unrelated parent, or forged creator run must fail. See the [child workspace trust regression](../../server/src/__tests__/task-workspace-child-trust.test.ts). This automated contract does not add live acceptance evidence.
 
 ### `workspace-management`
@@ -84,7 +122,26 @@ Manual: Provision a disposable workspace, wait for readiness, start an available
 
 - A link or running badge does not prove the service is reachable from the user’s browser.
 - Workspace IDs, runtime leases, and repository paths are not interchangeable.
+- Terminal workspace cleanup wakes after committed task/workspace/PR changes and
+  restores cooldown deadlines at startup. Empty lanes stop scanning. Display Git
+  results can lag by thirty seconds. Compatible records share one advisory Git
+  inspection per bounded page, while each record keeps its own delivery check.
+  Destructive cleanup starts a separate Git scan even if an older scan is running.
+  The [worker tests](../../server/src/__tests__/terminal-workspace-work.test.ts)
+  cover quiet lanes and deadlines. The
+  [service tests](../../server/src/__tests__/execution-workspaces-service.test.ts)
+  cover real PostgreSQL signals and retained worktrees. These tests do not
+  qualify an external wake alarm or a live provider deployment.
 - Organizational project, source project, task files, personal `AGENT_HOME`, and
   provider home have separate meanings. Private source ownership remains attached
   to copied files after source configuration changes or workspace closure.
 - Use [recovery](./recovery.md) for divergence/export repair and [CLI operations](./cli-operations.md) for local worktree tooling.
+
+### Storybook verification
+
+#### `closure`
+
+Scope: ui
+Storybook: Close-readiness checks, pending changes/active runs, blocked/pending/error close, retry close and eligible reopening.
+Production: Confirm owned workspace shutdown, preserved files/Git state and permitted lifecycle transition/reopening; Browser Use session closure is unrelated.
+Sources: Source: [ExecutionWorkspaceDetail.tsx](../../ui/src/pages/ExecutionWorkspaceDetail.tsx), [ExecutionWorkspaceCloseDialog.tsx](../../ui/src/components/ExecutionWorkspaceCloseDialog.tsx), [execution-workspaces.ts](../../server/src/routes/execution-workspaces.ts). Tests: [execution-workspaces-routes.test.ts](../../server/src/__tests__/execution-workspaces-routes.test.ts), [execution-workspaces-service.test.ts](../../server/src/__tests__/execution-workspaces-service.test.ts), [execution-workspace-reopen.test.ts](../../server/src/__tests__/execution-workspace-reopen.test.ts)

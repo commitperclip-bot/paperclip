@@ -15,7 +15,8 @@ Company members and agents cannot read this report.
    300 seconds. Save the returned `ownerId` and `expiresAt`. An existing drain
    returns 409. An unsupported purpose must leave automatic sleep disabled.
 3. Poll the report with that exact owner. Only
-   `{ "version": 1, "backgroundWork": "none" }` permits sleep. Require the same
+   `{ "version": 1, "backgroundWork": "none" }` permits ordinary idle sleep. The
+   optional routine protocol below requires a durable host alarm as well. Require the same
    `ownerId`, `draining: true`, zero run/wake counters, and enough remaining TTL
    for the provider stop. `present`, `unknown`, missing fields, or errors must
    keep the instance awake. Do not interpret `quiescent` alone as authorization.
@@ -34,6 +35,79 @@ Health and control mutations remain tracked through completion, including
 signed bootstrap writes. Only the task-drain read skips request tracking.
 Its authentication finishes under a separate work token before entering the
 report, so it counts concurrent writes without blocking on its own scan.
+
+## Scheduled routine wake protocol
+
+Verified signed Cloud control callers may opt into
+`GET /api/instance/task-drain?idleSleepSafety=1&scheduledWake=1&ownerId=<owner>`.
+Tenant tokens, browser instance administrators, local implicit actors, and agents
+cannot request this extension. Ordinary reports retain their existing behavior.
+
+If all other background-work checks pass, active routines may return
+`idleSleepSafety: { version: 2, backgroundWork: "none", scheduledWake }`.
+The proof has `version: 1`, `kind: "routines"`, a SHA-256 `generation`, and the
+earliest `nextWakeAt` across every company. Only enabled, unarchived schedule
+triggers with valid cron, timezone and future `next_run_at` qualify. Unsupported
+triggers, setup work, due work, unknown states and more than 10,000 active
+triggers keep the instance awake. Inactive triggers do not create obligations.
+Active routines without enabled triggers have no timed work. Definitions are
+read in the same repeatable-read transaction as the other durable checks.
+
+The host must commit one durable alarm for the exact stack under its live sleep
+lease before stopping compute. It must then re-read the same owned report and
+require the exact generation and deadline. Generation binds the process, hold
+owner and routine/trigger catalog, so restart or schedule edits invalidate it.
+No routine definitions or tenant identifiers appear in the proof. Failure to
+persist or validate the alarm abandons sleep. Cloud acknowledges persistence
+inside its controller; this report alone never authorizes scheduled sleep.
+
+Cloud must start waking early enough for measured startup latency and retry
+failed or missed wakes across controller restart. After wake, the existing
+routine scheduler owns execution, atomic claims and catch-up rules. Local
+scheduling is unchanged for self-hosted instances and whenever Cloud declines
+sleep. This first extension covers routines only. Agent timers, plugin jobs,
+retries, integrations and unsupported queues retain their existing blockers.
+All mutations must enter through the host admission/wake path. Independent
+database writers are outside this single-process protocol.
+
+Verify a full scheduled sleep/wake/execution cycle on staging before enabling
+this host capability. The [tests](../server/src/__tests__/idle-sleep-safety.test.ts)
+cover ownership, future deadlines, changed generations and conservative fallback.
+
+## Passive issues and scheduled monitors
+
+Signed Cloud control callers can request `scheduledWake=2` to include issue
+monitoring alongside routines. Earlier hosts requesting `scheduledWake=1`
+retain the routine-only rules, including the conservative open-issue check.
+Browser administrators and tenant credentials cannot request either extension.
+
+With the second capability, backlog tasks, unassigned todo tasks, explicit
+blocked tasks and human-owned tasks may be passive records. Their presence
+alone does not require compute. An assigned onboarding first task is also
+passive with an idle assignee before its first run, user-authored comment or user-resolved opening
+card. This uses the same awaiting-user predicate as recovery; a seeded greeting
+does not start work. User input still enters through the host wake path.
+Execution locks, automated pending review,
+conversation state, unknown state and dependency repair remain blockers. A
+blocked task whose blockers have all finished stays awake for reconciliation.
+Enabled task watchdogs and unsupported recovery keep their existing checks.
+Incoming changes still require the hosting admission and wake path.
+
+An active issue monitor needs a saved future `monitor_next_check_at` matching
+its validated execution policy, a company-scoped agent, no outstanding dispatch
+claim, and remaining attempts and timeout. Due, malformed, quota-recovery,
+unowned and inconsistent monitors keep the workspace awake. Inspection does
+not clear schedules, advance attempts or dispatch an agent.
+
+The combined report uses `version: 2` and a scheduled proof with `version: 1`
+and `kind: "routines_and_issue_monitors"`. Its deadline is the earliest required
+routine or monitor time across all companies. Its generation binds the current
+process, idle owner and inspected catalogs. Hosts must acknowledge this known
+proof kind, persist the alarm and validate the unchanged owned report before
+stopping compute. Existing hosts reject the new kind. Monitor dispatch and
+startup catch-up continue through the existing scheduler and atomic claims;
+self-hosted scheduling is unchanged. This capability does not cover all future
+work in the instance: every other safety check continues to apply.
 
 ## Retry history
 
@@ -83,6 +157,13 @@ default. The opt-in checkpoint mode below preserves a final backup instead of
 running the timer while asleep. A generation counter invalidates a
 scan if tracked work both starts and finishes during inspection. Reports remain
 unknown until startup recovery and HTTP tracking are installed.
+
+Terminal workspace recovery also registers a local sleep probe. Incomplete
+startup pages and failed recovery remain blockers until a successful pass.
+Active cleanup and unresolved producer transactions retain their admission holds.
+Cooldown and inspection-backoff timers are maintenance hints over retained domain
+rows. They can wait for the next wake and are restored at startup; they do not
+create external alarm coverage or exempt other persisted work from this report.
 
 ### Backup checkpoints for idle instances
 

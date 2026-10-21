@@ -1,4 +1,6 @@
+import { savedGitWorkspaceRestoration, ensureSavedGitCommit, GitCacheRestorationFailure } from "./git-workspace-restoration.js";
 import { sanitizeRuntimeServiceBaseEnv } from "./runtime-service-env.js";
+import { verifiedRecordedIsolatedRemoteSource } from "./isolated-remote-workspace-source.js";
 export { sanitizeRuntimeServiceBaseEnv } from "./runtime-service-env.js";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
@@ -3847,6 +3849,10 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       "Cannot rebuild the git worktree: the base project checkout directory does not exist.",
     );
   }
+  const restoration = savedGitWorkspaceRestoration({ metadata: input.workspace.metadata, companyId: input.agent.companyId,
+    workspaceId: input.workspace.id, cwd, baseCwd, repoUrl: input.workspace.repoUrl ?? input.base.repoUrl,
+    branchName: input.workspace.branchName ?? null });
+  const savedCommit = restoration?.commit ?? null;
   const repoRoot = await runGit(["rev-parse", "--show-toplevel"], baseCwd);
   await input.beforeSourceCopy?.(repoRoot, realized.worktreePath ?? cwd);
   const recordedBaseRefSha = readRecordedBaseRefSha(input.workspace.metadata);
@@ -3907,7 +3913,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     const currentBaseRefSha = reuseBaseRef ? await resolveBaseRefSha(repoRoot, reuseBaseRef) : null;
     // An unstarted-worktree refresh can fast-forward the checked-out branch.
     // Never run it for an attached operator-owned ref.
-    const refresh = realized.branchCreatedByRuntime && reuseBaseRef && currentBaseRefSha
+    const refresh = !savedCommit && realized.branchCreatedByRuntime && reuseBaseRef && currentBaseRefSha
       ? await refreshUnstartedWorktreeToBase({
           repoRoot,
           worktreePath: reuseWorktreePath,
@@ -3954,7 +3960,14 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
 
   await fs.mkdir(path.dirname(worktreePath), { recursive: true });
   await runGit(["worktree", "prune"], repoRoot).catch(() => {});
-  const restoreBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
+  if (savedCommit) {
+    await ensureSavedGitCommit(repoRoot, input.workspace.repoUrl ?? input.base.repoUrl!, savedCommit, input.resolveGitAuth ?? (async () => null));
+    const existingTip = await resolveBaseRefSha(repoRoot, `refs/heads/${branchName}`);
+    // Once restored, subsequent task commits own this branch. The saved commit
+    // still prevents a clean resumed worktree from refreshing to upstream HEAD.
+    if (existingTip && existingTip !== savedCommit && !restoration?.restored) throw new GitCacheRestorationFailure();
+  }
+  const restoreBaseRef = savedCommit ? null : input.workspace.baseRef ?? input.base.repoRef ?? null;
   const restoreRefreshWarnings = restoreBaseRef
     ? await refreshRemoteTrackingBaseRef(repoRoot, restoreBaseRef, input.resolveGitAuth)
     : [];
@@ -3991,7 +4004,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         `Execution workspace "${worktreePath}" cannot be restored because its operator-owned branch "${branchName}" no longer exists.`,
       );
     }
-    const baseRef = input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
+    const baseRef = savedCommit ?? input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
     const recreatedBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
@@ -4155,6 +4168,7 @@ async function deleteGitBranchAtVerifiedTip(input: {
 export async function cleanupExecutionWorkspaceArtifacts(input: {
   workspace: {
     id: string;
+    companyId: string;
     cwd: string | null;
     providerType: string;
     providerRef: string | null;
@@ -4181,15 +4195,16 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
 }) {
   const warnings: string[] = [];
   const workspacePath = input.workspace.providerRef ?? input.workspace.cwd;
+  const isolatedSource = await verifiedRecordedIsolatedRemoteSource(input.workspace);
   const repoRoot = input.workspace.providerType === "git_worktree" && workspacePath
     ? await resolveGitRepoRootForWorkspaceCleanup(
       workspacePath,
-      input.projectWorkspace?.cwd ?? null,
+      isolatedSource ?? input.projectWorkspace?.cwd ?? null,
     )
     : null;
   const cleanupEnv = buildExecutionWorkspaceCleanupEnv({
     workspace: input.workspace,
-    projectWorkspaceCwd: input.projectWorkspace?.cwd ?? null,
+    projectWorkspaceCwd: isolatedSource ?? input.projectWorkspace?.cwd ?? null,
   });
   // Callers can require the workspace to match an assessed snapshot before
   // cleanup begins. Destructive paths recheck immediately before removal.
@@ -5273,21 +5288,33 @@ export async function waitForRuntimeServiceReadiness(input: {
   let lastError = "service did not become ready";
   let lastCause: unknown;
   let probes = 0;
+  let sawServiceFailure = false;
   while (now() < deadline) {
-    const probeBudgetMs = Math.max(1, Math.min(RUNTIME_SERVICE_READINESS_PROBE_TIMEOUT_MS, deadline - now()));
+    const remainingMs = deadline - now();
+    // When the readiness budget is what bounds this probe, aborting it only means we ran out of
+    // time — it is not an observation about the service, so it must not replace one we already have.
+    const boundedByDeadline = remainingMs <= RUNTIME_SERVICE_READINESS_PROBE_TIMEOUT_MS;
+    const probeBudgetMs = Math.max(1, Math.min(RUNTIME_SERVICE_READINESS_PROBE_TIMEOUT_MS, remainingMs));
+    let probeSignal: AbortSignal | undefined;
     probes += 1;
     try {
-      const response = await fetchImpl(readinessUrl, { signal: AbortSignal.timeout(probeBudgetMs) });
+      probeSignal = AbortSignal.timeout(probeBudgetMs);
+      const response = await fetchImpl(readinessUrl, { signal: probeSignal });
       if (response.ok) return;
       lastError = `received HTTP ${response.status}`;
       lastCause = undefined;
+      sawServiceFailure = true;
     } catch (err) {
-      lastCause = err;
-      lastError = err instanceof Error ? err.message : String(err);
-      // Node fetch hides connection errors behind "fetch failed". Retain the
-      // transport cause so a refused port is distinguishable from a timeout.
-      if (err instanceof Error && err.cause instanceof Error) {
-        lastError += `: ${err.cause.message}`;
+      const abortedByDeadline = Boolean(probeSignal?.aborted) && boundedByDeadline;
+      if (!abortedByDeadline || !sawServiceFailure) {
+        lastCause = err;
+        lastError = err instanceof Error ? err.message : String(err);
+        // Node fetch hides connection errors behind "fetch failed". Retain the
+        // transport cause so a refused port is distinguishable from a timeout.
+        if (err instanceof Error && err.cause instanceof Error) {
+          lastError += `: ${err.cause.message}`;
+        }
+        sawServiceFailure = true;
       }
     }
     if (now() >= deadline) break;

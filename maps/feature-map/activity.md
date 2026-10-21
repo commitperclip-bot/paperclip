@@ -1,4 +1,8 @@
-# Dashboards, activity, and audit trails
+---
+navigation: {"section":"Oversight and operation","sectionOrder":70,"order":20}
+---
+
+# Dashboards and audit trails
 
 People inspect company health, recent activity, run history, and routine activity, then follow evidence back to the task or agent responsible.
 
@@ -56,3 +60,16 @@ the routine rather than treating that component test as a reachable journey.
 - Audit/activity events, run-log rows, first-party Telemetry, and operator OpenTelemetry traces are separate data paths.
 - A healthy stream or dashboard counter alone does not prove task success.
 - Cost and budget reports have their own [recipe](./budgets-costs.md).
+
+### Storybook verification
+
+#### `runs`
+
+Scope: ui
+Storybook: Mount AuditRuns selected status/agent/routine, linked task/agent, empty/loading/error/retry and 200-entry limit. Do not invent pagination.
+Production: GET /companies/{id}/heartbeat-runs and /routines/{id}/runs require company/read/privacy checks; real browser follows context links and confirms the referenced execution.
+Company run history defaults to 200 rows and caps explicit limits at 1,000.
+Summary contexts omit stored prompts and expand JSON once per returned row.
+The array response and run visibility/redaction checks remain in place.
+Agent detail links resolve older runs by ID outside the recent history page.
+Sources: Source: [AuditRuns.tsx](../../ui/src/pages/audit/AuditRuns.tsx), [heartbeats.ts](../../ui/src/api/heartbeats.ts), [routines.ts](../../ui/src/api/routines.ts). Tests: [AuditRuns.test.tsx](../../ui/src/pages/audit/AuditRuns.test.tsx), [heartbeat-run-privacy-routes.test.ts](../../server/src/__tests__/heartbeat-run-privacy-routes.test.ts), [routines-service.test.ts](../../server/src/__tests__/routines-service.test.ts)

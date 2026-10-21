@@ -1,5 +1,5 @@
 import { and, eq } from "drizzle-orm";
-import { agents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { agents, dotRunnerAssignments, grokBotDispatches, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { captureRunFailure, type RunFailureStatus } from "../sentry.js";
 import {
   collectRunFailureDiagnostics,
@@ -13,6 +13,7 @@ import { logger } from "../middleware/logger.js";
 import { isUnexpectedRunCancellation } from "./run-cancellation.js";
 import { readConnectionFailure, type ConnectionFailure } from "@paperclipai/adapter-utils/connection-failure";
 import { isAiConnectionConfigurationReason } from "./ai-connection-configuration-failure.js";
+import { readRunFailureReportingMode, type RunFailureReportingMode } from "../sentry-run-failure-policy.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 
@@ -37,6 +38,7 @@ function isRunFailureStatus(status: string): status is RunFailureStatus {
 }
 
 function readTaskId(run: HeartbeatRun): string | null {
+  if (run.issueId) return run.issueId;
   if (run.nativeIssueId) return run.nativeIssueId;
   const contextIssueId = run.contextSnapshot?.issueId;
   return typeof contextIssueId === "string" && contextIssueId.length > 0 ? contextIssueId : null;
@@ -165,6 +167,23 @@ function isHermesConnectionFailure(run: HeartbeatRun, options: RunFailureReportO
 }
 
 /**
+ * The orphan reaper proved a server restart stopped legacy setup before
+ * dispatch and made the run eligible for its bounded retry. Only that reaper
+ * branch pairs process loss with bootstrap evidence.
+ */
+function isRestartInterruptedSetup(run: HeartbeatRun): boolean {
+  if (
+    run.status !== "failed" || run.errorCode !== "process_lost" || run.runtimeMode !== "legacy" ||
+    run.executionStage !== "preparing" || run.processPid != null || run.processGroupId != null
+  ) return false;
+  const recovery = asRecord(run.resultJson?.executionRecovery);
+  const processLoss = asRecord(run.resultJson?.processLossDiagnostic);
+  return recovery?.kind === "bootstrap" && recovery.providerWorkStarted === false &&
+    processLoss?.retryEligible === true && processLoss.runPredatesObserver === true &&
+    processLoss.localCheck === "no_identifiers";
+}
+
+/**
  * The adapter proved the user's provider account is out of quota, and recovery
  * waits for its reset. Both fields come from the adapter's own classifier.
  */
@@ -172,6 +191,35 @@ function isProviderQuotaFailure(run: HeartbeatRun, options: RunFailureReportOpti
   return run.status === "failed" && run.errorCode === "provider_quota" &&
     asRecord(run.resultJson)?.errorFamily === "provider_quota" &&
     options.phase !== "setup" && run.signal == null;
+}
+
+function isCodexAcpModelCapacityFailure(run: HeartbeatRun, options: RunFailureReportOptions): boolean {
+  const result = asRecord(run.resultJson);
+  return run.status === "failed" && run.errorCode === "codex_transient_upstream" &&
+    result?.errorFamily === "transient_upstream" &&
+    asRecord(result.terminalSessionFailure)?.category === "service" &&
+    options.phase !== "setup" && run.signal == null;
+}
+
+/**
+ * The Grok endpoint refused every work wake with an HTTP 4xx, so the offer
+ * expired unaccepted. Durable delivery receipts prove the external cause. A
+ * local rejection (no HTTP status), any delivered wake, or accepted work stays
+ * reportable.
+ */
+async function isRejectedExternalBotWake(db: Db, run: HeartbeatRun): Promise<boolean> {
+  if (run.status !== "failed" || run.runtimeMode !== "native" || run.errorCode !== "native_provider_terminal_failed") return false;
+  const [finalization] = await db.select({ failureDetail: nativeRunFinalizations.failureDetail }).from(nativeRunFinalizations)
+    .where(and(eq(nativeRunFinalizations.runId, run.id), eq(nativeRunFinalizations.companyId, run.companyId)));
+  if (finalization?.failureDetail?.originalFailureCode !== "dot_assignment_expired") return false;
+  const offers = await db.select({ id: dotRunnerAssignments.id, acceptedAt: dotRunnerAssignments.acceptedAt }).from(dotRunnerAssignments)
+    .where(and(eq(dotRunnerAssignments.runId, run.id), eq(dotRunnerAssignments.companyId, run.companyId)));
+  if (offers.length !== 1 || offers[0]!.acceptedAt) return false;
+  const wakes = await db.select({ status: grokBotDispatches.status, httpStatus: grokBotDispatches.httpStatus }).from(grokBotDispatches)
+    .where(and(eq(grokBotDispatches.assignmentId, offers[0]!.id), eq(grokBotDispatches.companyId, run.companyId),
+      eq(grokBotDispatches.kind, "mailbox_updated")));
+  return wakes.length > 0 && wakes.every((wake) =>
+    wake.status === "rejected" && wake.httpStatus != null && wake.httpStatus >= 400 && wake.httpStatus < 500);
 }
 
 /**
@@ -186,15 +234,21 @@ function isProviderQuotaFailure(run: HeartbeatRun, options: RunFailureReportOpti
  * shutdown find and wait for the report — see `waitForPendingRunFailureReports`.
  */
 export function reportRunFailure(db: Db, run: HeartbeatRun, options: RunFailureReportOptions = {}): Promise<void> {
+  const mode = readRunFailureReportingMode();
+  if (mode === "off") return Promise.resolve();
   if (!isRunFailureStatus(run.status)) return Promise.resolve();
   if (run.status === "cancelled" && !isUnexpectedRunCancellation(run)) return Promise.resolve();
-  if (isMissingSecretConfigurationBlocker(run, options)) return Promise.resolve();
-  if (isAiConnectionSelectionBlocker(run, options)) return Promise.resolve();
-  if (isLocalPathWorkspaceConfigurationBlocker(run, options)) return Promise.resolve();
-  if (isGitConnectionFailure(run, options)) return Promise.resolve();
-  if (isProviderQuotaFailure(run, options)) return Promise.resolve();
+  if (mode === "unexpected" && (
+    isMissingSecretConfigurationBlocker(run, options) ||
+    isAiConnectionSelectionBlocker(run, options) ||
+    isLocalPathWorkspaceConfigurationBlocker(run, options) ||
+    isGitConnectionFailure(run, options) ||
+    isProviderQuotaFailure(run, options) ||
+    isCodexAcpModelCapacityFailure(run, options) ||
+    isRestartInterruptedSetup(run)
+  )) return Promise.resolve();
   const runStatus = run.status;
-  const report = captureTerminalRunFailure(db, run, runStatus, options);
+  const report = captureTerminalRunFailure(db, run, runStatus, options, mode);
   pendingRunFailureReports.add(report);
   void report.finally(() => pendingRunFailureReports.delete(report));
   return report;
@@ -205,6 +259,7 @@ async function captureTerminalRunFailure(
   run: HeartbeatRun,
   runStatus: RunFailureStatus,
   options: RunFailureReportOptions,
+  mode: RunFailureReportingMode,
 ): Promise<void> {
   try {
     const snapshot = redactRunFailureSecretValues({
@@ -221,13 +276,16 @@ async function captureTerminalRunFailure(
       .where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId)))
       .then((rows) => rows[0] ?? null);
 
-    if (isHermesConnectionFailure(run, options, agent?.adapterType)) return;
+    if (mode === "unexpected") {
+      if (isHermesConnectionFailure(run, options, agent?.adapterType)) return;
+      const rejectedExternally = await isRejectedExternalBotWake(db, run).catch((err) => {
+        logger.warn({ err, runId: run.id }, "failed to read bot wake receipts for run failure report");
+        return false;
+      });
+      if (rejectedExternally) return;
+    }
 
     const taskId = readTaskId(run);
-    if (!taskId) {
-      logger.warn({ runId: run.id }, "run failure report has no task id, skipping Sentry report");
-      return;
-    }
 
     // Resolve registered values before truncation. A failed resolution must
     // not send an incompletely redacted report.
@@ -237,6 +295,8 @@ async function captureTerminalRunFailure(
       redacted = await createRunSecretRedactionRegistry(db).redactForRun(run.companyId, run.id, snapshot);
     }
     captureRunFailure({
+      companyId: run.companyId,
+      agentId: run.agentId,
       taskId,
       runId: run.id,
       errorMessage: sanitizeRunFailureText(redacted.errorMessage, MAX_ERROR_MESSAGE_LENGTH),

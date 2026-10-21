@@ -1,5 +1,7 @@
+import { getRunExecutionTraceContext } from "../execution-preparation-timing.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
+import { isSpanContextValid, ROOT_CONTEXT, trace } from "@opentelemetry/api";
 
 import { runWithRuntimeParent } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import type { AdapterRuntimeEvent } from "../../adapters/index.js";
@@ -210,6 +212,10 @@ export function createNativeRunTrace(input: {
   const runIdHash = hashedId(input.runId);
   let rootSpan: SpanHandle;
   try {
+    const owned = getRunExecutionTraceContext(input.runId);
+    const trigger = process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim()
+      ? (owned ? trace.getSpan(owned) : trace.getActiveSpan())?.spanContext()
+      : undefined;
     rootSpan = tracing.tracer.startSpan("task.provider_session", {
       startTime: traceStartedAtMs,
       attributes: {
@@ -218,7 +224,8 @@ export function createNativeRunTrace(input: {
         "paperclip.task.run.trace_schema_version":
           NATIVE_RUN_TRACE_SCHEMA_VERSION,
       },
-    });
+      ...(trigger && isSpanContextValid(trigger) ? { links: [{ context: trigger }] } : {}),
+    }, ROOT_CONTEXT);
   } catch {
     rootSpan = NOOP_SPAN;
   }
@@ -338,7 +345,7 @@ export function createNativeRunTrace(input: {
             ),
           },
         },
-        parent.context,
+        parent.context ?? ROOT_CONTEXT,
       );
     } catch {
       span = NOOP_SPAN;
@@ -404,12 +411,8 @@ export function createNativeRunTrace(input: {
       duration_ms: durationMs,
       outcome,
     });
-    try {
-      if (outcome === "failed") state.span.setStatus({ code: 2 });
-      state.span.end(endedAtMs);
-    } catch {
-      // Tracing is diagnostic-only and must never change runner control flow.
-    }
+    if (outcome === "failed") { try { state.span.setStatus({ code: 2 }); } catch {} }
+    try { state.span.end(endedAtMs); } catch {}
     await emitCompletedSpanEvent({
       name: state.name,
       parentName: state.parentName,
@@ -494,17 +497,10 @@ export function createNativeRunTrace(input: {
     for (const scope of [...openScopes].reverse()) {
       await end(scope, { endedAtMs, outcome });
     }
-    try {
-      rootSpan.setAttribute(
-        "paperclip.task.run.wall_ms",
-        endedAtMs - traceStartedAtMs,
-      );
-      rootSpan.setAttribute("paperclip.task.run.outcome", outcome);
-      if (outcome === "failed") rootSpan.setStatus({ code: 2 });
-      rootSpan.end(endedAtMs);
-    } catch {
-      // Tracing is diagnostic-only and must never change runner control flow.
-    }
+    try { rootSpan.setAttribute("paperclip.task.run.wall_ms", endedAtMs - traceStartedAtMs); } catch {}
+    try { rootSpan.setAttribute("paperclip.task.run.outcome", outcome); } catch {}
+    if (outcome === "failed") { try { rootSpan.setStatus({ code: 2 }); } catch {} }
+    try { rootSpan.end(endedAtMs); } catch {}
     // Preserve the historical run-log record without emitting a duplicate
     // full-width child span into the OpenTelemetry waterfall.
     await emitCompletedSpanEvent({

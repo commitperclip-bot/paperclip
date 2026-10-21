@@ -15,6 +15,7 @@ import {
 } from "./redact-sensitive.js";
 import { recordResponsibleUserDenialOnActiveRun } from "../services/responsible-user-denial-run-outcomes.js";
 import { isExpectedMcpConnectionFailure } from "../services/mcp-connection-failure.js";
+import { isEndedDbPoolError } from "../database-retry.js";
 
 export interface ErrorContext {
   error: {
@@ -91,6 +92,12 @@ function reportCrash(error: Error, reportToSentry = true): void {
   const tc = getTelemetryClient();
   if (tc) trackErrorHandlerCrash(tc, { errorCode: error.name });
   if (reportToSentry) captureException(error);
+}
+
+/** Set by the orderly shutdown just before it ends the database pools. */
+function isDatabaseClosing(req: Request): boolean {
+  const locals = req.app?.locals as { paperclipDatabaseClosing?: boolean } | undefined;
+  return locals?.paperclipDatabaseClosing === true;
 }
 
 function getPaperclipDb(req: Request): Db | null {
@@ -263,6 +270,21 @@ export function errorHandler(
   ) {
     if (!res.headersSent) res.status(499);
     res.end();
+    return;
+  }
+
+  // Shutdown drains the HTTP listener before it ends the pool, but a handler
+  // whose client already disconnected (or whose socket the drain timeout
+  // closed) keeps running. Its next query then fails with CONNECTION_ENDED
+  // against the pool this process deliberately ended. That is shutdown, not a
+  // server fault, so skip the error sinks. Any other error during shutdown is
+  // still reported.
+  if (isDatabaseClosing(req) && isEndedDbPoolError(rootError)) {
+    if (!res.headersSent) {
+      res.status(503).json({ error: "Server is shutting down" });
+    } else {
+      res.end();
+    }
     return;
   }
 

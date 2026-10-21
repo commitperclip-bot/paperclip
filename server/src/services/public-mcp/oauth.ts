@@ -1,3 +1,4 @@
+import { authorizeExternalBotOperator, externalBotEnabled } from "../external-bot-authority.js";
 import { updateAgentConfigurationInTransaction } from "../agent-configuration-transaction.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { createHash, randomBytes } from "node:crypto";
@@ -84,7 +85,7 @@ export function createPublicMcpOAuth(db: Db, config: PublicMcpConfig, options: {
   const settings = instanceSettingsService(db);
   const isEnabled = async (queryDb: Db = db) => {
     const experimental = await (queryDb === db ? settings : instanceSettingsService(queryDb)).getExperimental();
-    return experimental.enablePublicMcp && (!agentConnection || experimental.enableOpenAiDot);
+    return experimental.enablePublicMcp && (!agentConnection || experimental.enableOpenAiDot || (experimental.enableGrokBot && experimental.enableNativeRunner));
   };
   async function assertEnabled(queryDb: Db = db) {
     if (!await isEnabled(queryDb)) throw new PublicMcpDisabledError();
@@ -272,10 +273,11 @@ export function createPublicMcpOAuth(db: Db, config: PublicMcpConfig, options: {
     const [binding] = await queryDb.select().from(dotAgentBindings).where(and(
       eq(dotAgentBindings.pairingCodeHash, hashMcpSecret(pairingCode)), isNull(dotAgentBindings.revokedAt),
     )).for("update");
-    if (!binding || binding.status !== "pairing" || binding.grantId || !binding.pairingExpiresAt || binding.pairingExpiresAt <= new Date()) throw invalidGrant();
+    if (!binding || !await externalBotEnabled(queryDb, binding.providerKind) || binding.status !== "pairing" || binding.grantId || !binding.pairingExpiresAt || binding.pairingExpiresAt <= new Date()) throw invalidGrant();
     if (request.requestedCompanyId && request.requestedCompanyId !== binding.companyId) throw invalidGrant();
     const [agent] = await queryDb.select().from(agents).where(and(eq(agents.id, binding.agentId), eq(agents.companyId, binding.companyId))).for("update");
-    if (!agent || agent.adapterType !== "paperclip_runner" || !canConfigureAgentConnection(agent)) throw invalidGrant();
+    if (!agent || agent.adapterType !== "paperclip_runner" || agent.adapterConfig.provider !== binding.providerKind || !canConfigureAgentConnection(agent)) throw invalidGrant();
+    if (binding.providerKind === "grok_bot") await authorizeExternalBotOperator(queryDb, binding.companyId, binding.operatorId);
     return { request, binding, agent };
   }
 
@@ -440,8 +442,9 @@ export function createPublicMcpOAuth(db: Db, config: PublicMcpConfig, options: {
         const membership = access.memberships.find(m => m.companyId === binding.companyId && m.status === "active");
         const [company] = await tx.select().from(companies).where(eq(companies.id, binding.companyId));
         if (!access.user || !membership || membership.membershipRole === "viewer" || !company || company.status === "archived") throw invalidGrant();
-        return { company: { id: company.id, name: company.name }, agent: { id: agent.id, name: agent.name },
-          permissions: "Start and accept work as this agent, coordinate permitted tasks and people, read assigned skills, and use assigned app tools. Reading assigned task attachment contents sends those contents to OpenAI and requires the agent’s separate attachment setting. Workspace files and sandboxed commands require the agent’s separate workspace setting. No board account or other-company access.",
+        return { providerKind: binding.providerKind, authorizingPerson: access.user.name,
+          company: { id: company.id, name: company.name }, agent: { id: agent.id, name: agent.name },
+          permissions: binding.providerKind === "grok_bot" ? "Work as this agent: find and create permitted tasks, claim admitted work sessions, report progress, ask questions, save documents and deliverables, and submit completion for normal review. Execution requires a current task-bound session. No board account or other-company access. Grok plugins are account-wide; linking this Bot does not isolate credentials from other Bots on your Grok account. Grok retains its own connected apps. Usage and spending are not reported." : "Start and accept work as this agent, coordinate permitted tasks and people, read assigned skills, and use assigned app tools. Reading assigned task attachment contents sends those contents to OpenAI and requires the agent’s separate attachment setting. Workspace files and sandboxed commands require the agent’s separate workspace setting. No board account or other-company access.",
           accessDuration: "Ongoing until revoked. This connection does not expire from inactivity.",
           pairingExpiresAt: binding.pairingExpiresAt!.toISOString() };
       });
@@ -460,7 +463,7 @@ export function createPublicMcpOAuth(db: Db, config: PublicMcpConfig, options: {
         await tx.update(mcpOauthGrants).set({ agentId: binding.agentId }).where(eq(mcpOauthGrants.id, grant.id));
         await tx.update(dotAgentBindings).set({ grantId: grant.id, status: "connected", pairingCodeHash: null,
           pairingExpiresAt: null, updatedAt: new Date() }).where(eq(dotAgentBindings.id, binding.id));
-        await updateAgentConfigurationInTransaction(tx as unknown as Db, agent.id, { adapterConfig: { ...agent.adapterConfig, dotBindingId: binding.id } },
+        await updateAgentConfigurationInTransaction(tx as unknown as Db, agent.id, { adapterConfig: { ...agent.adapterConfig, [binding.providerKind === "grok_bot" ? "externalBindingId" : "dotBindingId"]: binding.id } },
           { recordRevision: { createdByUserId: binding.operatorId, source: "dot-pairing" } });
         await logActivity(tx as unknown as Db, { companyId: binding.companyId, actorType: "user", actorId: binding.operatorId,
           action: "dot.paired", entityType: "agent", entityId: binding.agentId,
@@ -570,13 +573,15 @@ export function createPublicMcpOAuth(db: Db, config: PublicMcpConfig, options: {
       await fenceAgentGrant(grant);
     },
     async listConnections(userId: string) {
-      const rows = await db.select({ grant: mcpOauthGrants, clientName: mcpOauthClients.name, companyName: companies.name, userName: authUsers.name, userImage: authUsers.image })
+      const rows = await db.select({ grant: mcpOauthGrants, clientName: mcpOauthClients.name, companyName: companies.name, companyPrefix: companies.issuePrefix, userName: authUsers.name, userImage: authUsers.image, agent: { id: agents.id, name: agents.name, config: agents.adapterConfig } })
         .from(mcpOauthGrants).innerJoin(mcpOauthClients, eq(mcpOauthGrants.clientId, mcpOauthClients.id))
         .innerJoin(companies, eq(companies.id, mcpOauthGrants.companyId))
         .leftJoin(authUsers, eq(authUsers.id, mcpOauthGrants.userId))
+        .leftJoin(agents, and(eq(agents.id, mcpOauthGrants.agentId), eq(agents.companyId, mcpOauthGrants.companyId)))
         .where(eq(mcpOauthGrants.userId, userId));
-      return rows.map(({ grant, clientName, companyName, userName, userImage }) => ({
-        id: grant.id, companyId: grant.companyId, clientName, companyName,
+      return rows.map(({ grant, clientName, companyName, companyPrefix, userName, userImage, agent }) => ({
+        id: grant.id, companyId: grant.companyId, clientName, companyName, companyPrefix,
+        agent: agent ? { id: agent.id, name: agent.name, provider: String(agent.config.provider ?? "") } : null,
         user: userName === null ? null : { name: userName, image: userImage }, scopes: grant.scopes,
         createdAt: grant.createdAt.toISOString(), revokedAt: grant.revokedAt?.toISOString() ?? null,
       }));

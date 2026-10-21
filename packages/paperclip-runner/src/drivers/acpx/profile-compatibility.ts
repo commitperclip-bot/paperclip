@@ -8,7 +8,7 @@ export type AcpxProfileVersion = HistoricalAcpxProfileVersion | CurrentAcpxProfi
 
 const historicalVersions: Readonly<Record<string, readonly HistoricalAcpxProfileVersion[]>> = {
   pi: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], claude: [1, 2, 3, 4, 5], codex: [1, 2, 3, 4, 5],
-  grok: [1, 2, 3, 4, 5], copilot: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+  grok: [1, 2, 3, 4, 5], copilot: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
   cursor: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
 };
 

@@ -1492,6 +1492,10 @@ export class DurablePrpControlPlane {
   #expectedRunnerDigest: string;
   #server: Server | null = null;
   #connections = new Set<AuthorityConnection>();
+  #eventOwner: AuthorityConnection | null = null;
+  // Set when the last authenticated Runner connection closes; cleared on the
+  // next authentication. Diagnostic only: it never gates authority.
+  #runnerDisconnectedAt: number | null = null;
   #connectionProcessing = new Map<AuthorityConnection, Promise<void>>();
   #pendingSemanticCalls = new Set<string>();
   #semanticCallbacksRetired = false;
@@ -1652,6 +1656,15 @@ export class DurablePrpControlPlane {
     return [...this.#connections].filter(
       (connection) => connection.secureChannel !== null,
     ).length;
+  }
+
+  /**
+   * Milliseconds since the last authenticated Runner connection closed, or
+   * null when a Runner is connected or has never authenticated.
+   */
+  runnerDisconnectedForMs(now = Date.now()): number | null {
+    if (this.#runnerDisconnectedAt === null || this.activeRunnerConnectionCount() > 0) return null;
+    return Math.max(0, now - this.#runnerDisconnectedAt);
   }
 
   /** A reusable close requires every admitted callback's exact durable result. */
@@ -2084,7 +2097,11 @@ export class DurablePrpControlPlane {
         };
         void tail.then(release, release);
       },
-      onClose: () => this.#connections.delete(connection),
+      onClose: () => {
+        this.#connections.delete(connection);
+        if (connection.secureChannel !== null && this.activeRunnerConnectionCount() === 0)
+          this.#runnerDisconnectedAt ??= Date.now();
+      },
     });
     this.#connections.add(connection);
     return {
@@ -2746,6 +2763,8 @@ export class DurablePrpControlPlane {
       pending.serverProof,
       clientProof,
     );
+    this.#runnerDisconnectedAt = null;
+    this.#eventOwner = connection;
     for (const active of this.#connections) {
       if (active !== connection && active.secureChannel !== null)
         active.close();
@@ -3086,6 +3105,8 @@ export class DurablePrpControlPlane {
     connection: AuthorityConnection,
     envelope: Record<string, unknown>,
   ): Promise<void> {
+    if (this.#eventOwner !== connection) return;
+    const identity = this.#identity;
     if (this.#protocolIntegrityError !== null) {
       connection.close();
       return;
@@ -3218,6 +3239,7 @@ export class DurablePrpControlPlane {
     try {
       await this.#onCommittedEvent?.(event);
     } catch (error) {
+      if (this.#eventOwner !== connection || this.#identity !== identity) return;
       if (error instanceof NativeSessionProtocolIntegrityError) {
         this.#failProtocolIntegrity(connection, error);
       } else {
@@ -3225,6 +3247,7 @@ export class DurablePrpControlPlane {
       }
       return;
     }
+    if (this.#eventOwner !== connection || this.#identity !== identity) return;
     // Another authenticated connection can replace this one while its commit
     // is in flight. Once that exact owner has faulted, even a prior successful
     // commit cannot reopen delivery or invoke a new business operation.

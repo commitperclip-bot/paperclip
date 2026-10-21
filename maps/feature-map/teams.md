@@ -1,4 +1,8 @@
-# Team packages and catalog installation
+---
+navigation: {"section":"Agents and reusable capabilities","sectionOrder":30,"order":40}
+---
+
+# Team packages and installation
 
 Operators can preview and install a team package with its agents and related resources. Catalog/package installation is available through the CLI/API; the repository also contains catalog UI components that are not a current top-level route.
 

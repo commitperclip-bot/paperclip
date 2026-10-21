@@ -6,7 +6,7 @@ import { Button } from "../ui/button";
 import { DialogDescription, DialogTitle } from "../ui/dialog";
 import { cn } from "@/lib/utils";
 
-export type ExternalAgentPreset = "dot" | "hermes" | "other";
+export type ExternalAgentPreset = "dot" | "grok_bot" | "hermes" | "other";
 export type DotConnectionState = {
   phase: "waiting" | "connected" | "subscribed" | "testing" | "finishing" | "ready";
   problem?: "event_timeout" | "prompt_unavailable" | "offline" | "agent_unavailable";
@@ -14,18 +14,19 @@ export type DotConnectionState = {
 
 const presets = [
   { id: "dot", name: "Dot", adapter: "openai_dot", description: "Your Dot in ChatGPT" },
+  { id: "grok_bot", name: "Grok Bot", adapter: "grok_bot", description: "An existing Bot in Grok" },
   { id: "hermes", name: "Hermes", adapter: "hermes_gateway", description: "An existing Hermes agent" },
   { id: "other", name: "Other", adapter: "http", description: "Any agent that can connect to Paperclip" },
 ] as const;
 
-export function ExternalAgentPresetPicker({ onSelect, dotDisabledReason }: { onSelect: (preset: ExternalAgentPreset) => void; dotDisabledReason?: string }) {
-  return <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+export function ExternalAgentPresetPicker({ onSelect, dotDisabledReason, grokDisabledReason }: { onSelect: (preset: ExternalAgentPreset) => void; dotDisabledReason?: string; grokDisabledReason?: string }) {
+  return <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
     {presets.map(preset => <button
       key={preset.id}
       type="button"
       onClick={() => onSelect(preset.id)}
-      disabled={preset.id === "dot" && !!dotDisabledReason}
-      title={preset.id === "dot" ? dotDisabledReason : undefined}
+      disabled={preset.id === "dot" && !!dotDisabledReason || preset.id === "grok_bot" && !!grokDisabledReason}
+      title={preset.id === "dot" ? dotDisabledReason : preset.id === "grok_bot" ? grokDisabledReason : undefined}
       className="flex aspect-square flex-col items-center justify-center gap-3 rounded-lg border border-border bg-card px-3 py-4 text-center transition-colors disabled:opacity-50 hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
     >
       <AdapterMark type={preset.adapter} className="size-8" />
@@ -80,9 +81,10 @@ export function DotConnectionChecks({ state }: { state: DotConnectionState }) {
 /** Shared presentation for the invitation flow. The caller owns invitations and watching. */
 export function ExternalAgentInviteContent({
   preset, prompt, companyName, connection, onSelect, onBack, onClose, onCopied, onRetry, onNewPrompt,
-  dotDisabledReason, busy = false, error, approvalHref,
+  dotDisabledReason, grokDisabledReason, busy = false, error, approvalHref,
 }: {
   dotDisabledReason?: string;
+  grokDisabledReason?: string;
   busy?: boolean;
   error?: string;
   approvalHref?: string;
@@ -126,8 +128,8 @@ export function ExternalAgentInviteContent({
         </div>
       </div>
       {error && <div role="alert" className="space-y-3 text-sm text-destructive"><p>{error}</p><Button variant="outline" disabled={busy} onClick={onRetry}>Try again</Button></div>}
-      {!provider ? <><ExternalAgentPresetPicker onSelect={onSelect} dotDisabledReason={dotDisabledReason} />
-        {dotDisabledReason && <p className="text-sm text-muted-foreground">{dotDisabledReason}</p>}</>
+      {!provider ? <><ExternalAgentPresetPicker onSelect={onSelect} dotDisabledReason={dotDisabledReason} grokDisabledReason={grokDisabledReason} />
+        {dotDisabledReason && <p className="text-sm text-muted-foreground">{dotDisabledReason}</p>}{grokDisabledReason && grokDisabledReason !== dotDisabledReason && <p className="text-sm text-muted-foreground">{grokDisabledReason}</p>}</>
         : approvalHref ? <p className="text-sm text-muted-foreground">An organization admin needs to approve this agent before Dot can connect. This page will update after approval.</p>
         : busy && !prompt && connection.phase === "waiting" ? <p role="status" className="text-sm text-muted-foreground">Preparing your invitation…</p> : dot ? <>
         <div className="border-t pt-6"><DotConnectionChecks state={connection} />

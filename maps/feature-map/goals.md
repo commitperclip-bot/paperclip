@@ -1,3 +1,7 @@
+---
+navigation: {"section":"Projects and execution","sectionOrder":40,"order":20}
+---
+
 # Goals and work alignment
 
 People define company and lower-level goals and connect projects and tasks to the outcome they serve.
@@ -47,3 +51,23 @@ Manual: Compare a task with an explicit goal to one relying on project context. 
 
 - A goal status is not an independently measured proof of business success.
 - Do not infer a complete goal browser test from the small properties-toggle suite.
+
+### Storybook verification
+
+#### `alignment`
+
+Scope: ui
+Storybook: Project/task goal selection, explicit/inherited context and invalid association error.
+Production: Persist same-company valid association, reject invalid/cross-company reference, verify explicit versus inherited server context after reload.
+Sources: Source: [ProjectProperties.tsx](../../ui/src/components/ProjectProperties.tsx), [GoalDetail.tsx](../../ui/src/pages/GoalDetail.tsx). Tests: [project-goal-validation.test.ts](../../server/src/__tests__/project-goal-validation.test.ts), [issues-goal-context-routes.test.ts](../../server/src/__tests__/issues-goal-context-routes.test.ts), [issue-goal-fallback.test.ts](../../server/src/__tests__/issue-goal-fallback.test.ts), [project-goal.test.ts](../../cli/src/__tests__/project-goal.test.ts)
+
+#### `navigation`
+
+Scope: ui
+Storybook: Parent/child goal and project/task context links, empty/unavailable context and permitted destination.
+Production: Follow actual goal/project/task records and compare explicit versus inherited context; ensure reload and inaccessible destination behavior.
+Sources: Source: [GoalDetail.tsx](../../ui/src/pages/GoalDetail.tsx), [GoalProperties.tsx](../../ui/src/components/GoalProperties.tsx). Tests: [GoalDetail.test.tsx](../../ui/src/pages/GoalDetail.test.tsx), [issues-goal-context-routes.test.ts](../../server/src/__tests__/issues-goal-context-routes.test.ts), [issue-goal-fallback.test.ts](../../server/src/__tests__/issue-goal-fallback.test.ts)
+
+### Documentation scope: Goals, dashboards, costs, and activity
+
+Core goal/report/budget/audit journeys are mapped. Every aggregation/filter combination, cost source, and overlapping budget window still needs dedicated cases.

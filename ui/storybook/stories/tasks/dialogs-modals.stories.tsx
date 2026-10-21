@@ -683,6 +683,17 @@ const meta = {
           "Open-state stories for Paperclip creation dialogs, workspace confirmations, document diffing, image attachments, and path helper modals.",
       },
     },
+    paperclip: {
+      "capabilities": [
+        "tasks/create",
+        "agents/hire",
+        "projects/lifecycle",
+        "goals/hierarchy"
+      ],
+      "implementation": "production",
+      "boundary": "fixtures",
+      "notes": "The filter uses one lowercase label without helper text. All chat-channel tasks count as bot-created; the focused visibility stories cover human-initiated channel work."
+    },
   },
 } satisfies Meta;
 

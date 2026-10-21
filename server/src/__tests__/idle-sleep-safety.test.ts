@@ -6,7 +6,7 @@ import {
   agentInstructionWorkingCopies, agents, agentApiKeys, agentWakeupRequests, companies, companySecretProposals, createDb,
   adapterAuthSessions, environments, environmentLeases, executionWorkspaces,
   heartbeatRuns, issues, issueWatchdogs, issueThreadInteractions, issueQuestionResponseDeliveries,
-  projects, projectWorkspaces, routines, toolApplications, toolConnections, workspaceOperations, executionWorkspaceRuntimeLeases, type Db,
+  projects, projectWorkspaces, routines, routineTriggers, toolApplications, toolConnections, workspaceOperations, executionWorkspaceRuntimeLeases, type Db,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { readIdleSleepSafety, type IdleSleepDrainStatus } from "../services/idle-sleep-safety.js";
@@ -175,6 +175,7 @@ if (!support.supported) console.warn(`Skipping idle sleep Postgres tests: ${supp
   afterAll(async () => { await database?.cleanup(); });
 
   const read = () => readIdleSleepSafety(db, owned, () => now, ownerId, emptyLocal);
+  const readScheduled = () => readIdleSleepSafety(db, owned, () => now, ownerId, emptyLocal, undefined, undefined, true);
   async function seed() {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -184,6 +185,84 @@ if (!support.supported) console.warn(`Skipping idle sleep Postgres tests: ${supp
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", status: "succeeded" });
     return { companyId, agentId, runId };
   }
+
+  async function scheduledRoutine(at = now + 600_000) {
+    const fixture = await seed();
+    const [routine] = await db.insert(routines).values({ companyId: fixture.companyId,
+      title: "Scheduled fixture", status: "active", assigneeAgentId: fixture.agentId }).returning();
+    const [trigger] = await db.insert(routineTriggers).values({ companyId: fixture.companyId,
+      routineId: routine!.id, kind: "schedule", cronExpression: "*/15 * * * *", timezone: "UTC",
+      nextRunAt: new Date(at), enabled: true, archived: false, setupPending: false }).returning();
+    return { ...fixture, routine: routine!, trigger: trigger! };
+  }
+
+  it("scheduled routines require the opt-in report and retain their durable definitions", async () => {
+    const f = await scheduledRoutine();
+    expect(await read()).toEqual(present);
+    const result = await readScheduled();
+    expect(result).toMatchObject({ version: 2, backgroundWork: "none", scheduledWake: {
+      kind: "routines", version: 1, nextWakeAt: new Date(now + 600_000).toISOString(),
+    } });
+    expect(result.scheduledWake?.generation).toMatch(/^[a-f0-9]{64}$/);
+    expect(await db.select().from(routineTriggers).where(eq(routineTriggers.id, f.trigger.id)))
+      .toMatchObject([{ nextRunAt: f.trigger.nextRunAt, cronExpression: f.trigger.cronExpression }]);
+    expect((await readScheduled()).scheduledWake).toEqual(result.scheduledWake);
+  });
+  it("scheduled routines cover all companies and invalidate a moved-earlier alarm", async () => {
+    await scheduledRoutine(now + 900_000);
+    const f = await scheduledRoutine(now + 600_000);
+    const first = await readScheduled();
+    expect(first.scheduledWake?.nextWakeAt).toBe(new Date(now + 600_000).toISOString());
+    await db.update(routineTriggers).set({ nextRunAt: new Date(now + 300_000) }).where(eq(routineTriggers.id, f.trigger.id));
+    const edited = await readScheduled();
+    expect(edited.scheduledWake?.nextWakeAt).toBe(new Date(now + 300_000).toISOString());
+    expect(edited.scheduledWake?.generation).not.toBe(first.scheduledWake?.generation);
+  });
+  it.each([
+    { kind: "webhook" }, { setupPending: true }, { nextRunAt: null },
+    { nextRunAt: new Date(now) }, { cronExpression: "bad" }, { timezone: "Unknown/Zone" },
+  ])("scheduled routines retain unsupported or due work: %j", async change => {
+    const f = await scheduledRoutine();
+    await db.update(routineTriggers).set(change).where(eq(routineTriggers.id, f.trigger.id));
+    expect(await readScheduled()).toEqual(present);
+  });
+  it("scheduled routines cannot exempt external API credentials or an unowned hold", async () => {
+    const f = await scheduledRoutine();
+    expect(await readIdleSleepSafety(db, owned, () => now, "stale", emptyLocal, undefined, undefined, true)).toEqual(unknown);
+    await db.insert(agentApiKeys).values({ companyId: f.companyId, agentId: f.agentId,
+      name: "Fixture external automation", keyHash: "fixture-hash" });
+    expect(await readScheduled()).toEqual(present);
+  });
+  it("scheduled routines ignore disabled triggers and fail closed on unknown routine states", async () => {
+    const f = await scheduledRoutine();
+    await db.update(routineTriggers).set({ enabled: false }).where(eq(routineTriggers.id, f.trigger.id));
+    expect(await readScheduled()).toEqual(none);
+    await db.update(routines).set({ status: "unknown" }).where(eq(routines.id, f.routine.id));
+    expect(await readScheduled()).toEqual(present);
+  });
+  it("scheduled routines reject a trigger with a different company", async () => {
+    const f = await scheduledRoutine();
+    const other = await seed();
+    await db.update(routineTriggers).set({ companyId: other.companyId }).where(eq(routineTriggers.id, f.trigger.id));
+    expect(await readScheduled()).toEqual(present);
+  });
+  it.each(["checkpoint", "local inspection"])("keeps a routine awake when it becomes due during %s", async stage => {
+    await scheduledRoutine(now + 1000);
+    let clock = now;
+    let inspections = 0;
+    const inspect = async () => {
+      if (++inspections === 2 && stage === "local inspection") clock += 1000;
+      return "none" as const;
+    };
+    const checkpoint = stage === "checkpoint" ? async () => {
+      const done = beginIdleTrackedWork();
+      clock += 1000;
+      done();
+      return true;
+    } : undefined;
+    expect(await readIdleSleepSafety(db, owned, () => clock, ownerId, inspect, undefined, checkpoint, true)).toEqual(present);
+    expect(idleWorkSnapshot().active).toBe(0);
+  });
 
   it.each(["succeeded", "failed", "cancelled", "timed_out", "interrupted"])(
     "permits a finished %s run with a consumed retry date without changing history", async status => {

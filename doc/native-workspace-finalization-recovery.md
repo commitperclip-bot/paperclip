@@ -1,5 +1,21 @@
 # Native workspace finalization ownership and recovery
 
+A native provider can fail before it submits a result while its workspace still
+contains unpublished edits. A prepared workspace reference is not an export
+receipt. Terminal provider failure pins the exact bound sandbox and records a
+file-recovery obligation in the same transaction as the failed run. Both setup
+failure handlers record that obligation before their terminal writer and provider
+cleanup run. This includes descriptor reads that fail inside runtime selection. Only its exact live recovery claim can settle an owned
+preparation failure; another owner or a stale claim prevents cleanup. Settling
+that claim and recording file retention share a transaction.
+
+The recovery card names the original run and requires evidence that its exact
+allocation stopped and its files were recovered. Recording that evidence does
+not retry the old turn, certify unknown external actions, change the current task
+owner or status, or require an accepted native result. Accepted-result export
+recovery and same-run provider recovery keep their existing paths. An export
+that has already finalized does not create this file obligation.
+
 Native workspace export and merge acquire a PostgreSQL advisory lock scoped to
 company and run before the first physical copyback. The live heartbeat and the
 reconciler share that lock. Recovery skips a busy owner without recording another
@@ -35,6 +51,54 @@ leave tar/Git children alive, so incomplete copyback requires operator stop
 verification even on the same host. PID reuse is checked against its recorded
 start time rather than trusted by PID alone.
 
+When PostgreSQL configures an idle-transaction timeout, the owner probes its
+dedicated lock transaction at one third of that interval, capped at
+30 seconds. The probe stops and joins before the transaction is released. This
+keeps a live copyback from losing its lock only because filesystem work has no
+database statements. It does not disable the database timeout or reconnect a
+failed lock session. Publication still requires the physical connection and
+the exact durable owner token. A disabled timeout adds no periodic probe.
+
+## Automatic cloud recovery
+
+New Railway copyback receipts record the exact project, environment, service and
+deployment ID. On takeover, the existing finalization reconciler asks the cloud
+harness to inspect that deployment. The harness resolves the stack's owned
+resources independently and issues a short-lived Ed25519 receipt only when the
+exact deployment is `REMOVED` with `deploymentStopped: true`. This covers all
+processes in the deployment, including orphaned copyback children. Missing,
+truncated, live or unavailable provider evidence leaves the physical fence intact.
+
+The tenant verifies the configured harness key, disjoint receipt audience, stack,
+run, owner token, deployment identity and expiry. It records proof and an activity
+entry when replacing only the exact owner under the existing advisory lock. The
+normal reconciler resumes the accepted result; it does not create a provider turn
+or change approval/monitor waits. A changed owner during verification fails closed.
+
+Stop proof alone does not authorize old work to overwrite a current task. After
+the provider read, automatic recovery uses the operator path's shared binding
+checks under short coordinator, issue and run row locks, atomically with the
+owner claim. The task must still be open, assigned to the run or its authoritative
+review participant, and bound to that running native execution and accepted
+result. A different checkout, newer execution or queued/running legacy execution
+prevents takeover. Publication checks repeat this validation; row locks are never
+held across physical copyback I/O.
+
+The harness endpoint is `POST /v1/tenant/workspace-worker-stop`. The fleet-wide
+server token authorizes a read request, never stop evidence: responses must be
+signed by the harness. This endpoint requires the companion cloud harness change.
+Deploying only the application keeps unknown owners fenced. No cloud provider
+credentials are delivered to tenant applications.
+
+The task view shows only “Restoring saved work…” after the server confirms recovery
+or an operator queues it,
+then removes the notice when commitment resolves recovery. It exposes no process
+identifiers, shutdown form or manual resume control. Legacy receipts without
+platform identity and unsupported platforms say operator assistance is needed;
+operators use the documented exact-owner API below after independent stop proof.
+The three diagnosed historical receipts do not gain a deployment identity merely
+by upgrading. Never infer one from elapsed time or a hostname.
+
 ## Unverified copyback after controller replacement
 
 Generic orphan recovery does not turn a missing provider PID into `process_lost`
@@ -65,6 +129,48 @@ An instance operator must first verify through the deployment platform that the
 exact prior controller **and its copyback subprocesses** have stopped. Retain the
 sandbox, accepted native result, and workspace descriptor. Do not run a new
 provider turn, delete workspace contents, or relax archive confinement.
+
+For legacy receipts, an authorized company owner, company administrator or
+instance administrator records independently verified platform evidence through
+the operator API. The task has no shutdown form or resume control. The API is
+`POST /api/issues/:id/recovery-actions/resume-workspace-finalization` with:
+
+```json
+{
+  "actionId": "<recovery-action-id>",
+  "runId": "<run-id>",
+  "ownerToken": "<owner-token-from-recovery-evidence>",
+  "controllerAndCopybackStopped": true,
+  "stopEvidence": "<deployment-platform evidence for this controller and its children>"
+}
+```
+
+This is an operator attestation, not an automatic deployment-platform probe.
+The separate `runtime:confirm_owner_stop` authorization action limits this
+attestation to active company owners or administrators, the trusted local board,
+or an instance administrator. Ordinary runtime managers and agents cannot release
+the physical owner receipt. Missing role data keeps the client notice read-only.
+A
+missing advisory connection alone is insufficient. Admission rejects an active
+copyback lock, an observably live local controller, a changed owner, a newer run,
+or an unbound result. It records the exact owner and operator evidence atomically
+with releasing the receipt. The accepted result, workspace descriptor, source
+lease, task status, monitors, and approval waits are unchanged. The ordinary
+reconciler performs copyback and applies the saved result through the status
+arbiter. No provider wake is enqueued. The recovery action remains visible until
+finalization commits. Admission supports saved-result copyback from `result_accepted`,
+`workspace_finalizing`, and `retryable_failure`; an abandoned retry does not need
+a replacement run. The existing retry schedule remains unchanged.
+Repeating the same confirmation before reconciliation is
+idempotent; it cannot release a newer owner. Generic recovery resolution, including
+false-positive dispositions, cannot dismiss this hold or bypass saved-result
+finalization.
+
+Repeated sweeps preserve these copyback-specific instructions, including for
+older actions whose recovery budget was already exhausted. They must never
+recommend starting a replacement provider run for this hold.
+
+For older servers without this action, the maintenance fallback follows.
 
 After that platform verification, use a database maintenance transaction to
 release only the exact receipt shown by the recovery action. Replace the four
@@ -138,8 +244,8 @@ A board member with runtime management access can complete the saved result:
    the export failure while preserving all user files. Restore transport access
    or other provider prerequisites before retrying. Extending the sandbox
    retention window can be necessary during this repair.
-3. In the task's **Workspace export needs repair** notice, describe the repair and
-   choose **Retry workspace export**. The equivalent board API is
+3. Use the operator API to record the repair and request export-only retry. The
+   task shows operator assistance is needed, without an infrastructure form. The board API is
    `POST /api/issues/:id/recovery-actions/retry-workspace-export` with
    `{ "actionId": "<recovery-action-id>", "runId": "<run-id>", "repairNote": "<repair and preservation evidence>" }`.
 4. Confirm the same run commits, the saved result determines the task outcome,

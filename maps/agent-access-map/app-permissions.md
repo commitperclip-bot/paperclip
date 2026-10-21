@@ -82,6 +82,15 @@ own policy and access review.
 Gaps: Catalog refresh/review and quarantined-action enablement are management
 operations.
 
+Daytona also checks its deployed native contract on the board's
+`GET /api/tool-connections/{connectionId}/catalog`. A changed saved catalog
+refreshes under the viewing human's credential context. Retired tools are
+hidden even if refresh fails. Agent discovery and dispatch reject retired names
+and stale same-name contracts before refresh; new/changed tools stay quarantined until reviewed. The
+[database-backed Daytona fixtures](../../server/src/__tests__/daytona-connection.test.ts)
+exercise this boundary through real run-bound gateway sessions with fixture
+provider responses. They do not qualify a live Daytona account or agent model.
+
 ## `test-action`
 
 Review: `baseline`.

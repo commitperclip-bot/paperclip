@@ -83,6 +83,13 @@ remaining operations before qualifying the whole capability.
 Gaps: An initiation endpoint exists; it is not authorization to complete the person's
 credential flow.
 
+Daytona native setup uses an organization API key in the selected personal or
+company vault grant. It does not borrow sandbox-provider credentials or CLI
+login tokens. Agents use assigned provider tools through the normal run-bound
+gateway; they cannot export the key. [Database-backed fixtures](../../server/src/__tests__/daytona-connection.test.ts)
+cover selected vault ownership and gateway reads/writes with provider responses
+replaced by fixtures. Real provider authentication remains unqualified.
+
 ## `handoff`
 
 Review: `baseline`.
@@ -180,6 +187,14 @@ verify any listed agent request/result path separately. A delegated operation ne
 own policy and access review.
 
 Gaps: Provider endpoint, represented agent and linked sender are operator choices today.
+
+Internal recovery: Telegram discovery walks bounded pages at startup. Configuration
+commits only queue the changed connection; durable maintenance rows supply retry deadlines. Inactive subscription
+repair is parked until an endpoint or connection change. This creates no agent
+management permission or new API. Local database-backed provider-fixture tests in
+[channel integration](../../server/src/__tests__/chat-channels.integration.test.ts)
+cover recovery, rollback, retries and idle query silence; they do not establish
+live provider or agent access.
 
 ## `failure`
 

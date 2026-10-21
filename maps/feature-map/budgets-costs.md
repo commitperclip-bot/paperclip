@@ -1,4 +1,8 @@
-# Costs, budgets, and spending controls
+---
+navigation: {"section":"Oversight and operation","sectionOrder":70,"order":10}
+---
+
+# Costs and budgets
 
 Operators inspect recorded spend and configure budget controls for the company, projects, and agents. Hard stops pause or prevent eligible work until the governing incident is resolved.
 
@@ -47,3 +51,12 @@ Manual: Create a small fixture budget, cross its threshold with synthetic record
 - Paperclip cost accounting is not a provider invoice or a promise about externally billed spend.
 - Company, project, and agent gates can overlap; fixing one may leave another active.
 - A successful retry must not bypass an unresolved budget hold.
+
+### Storybook verification
+
+#### `resolution`
+
+Scope: ui
+Storybook: Mount BudgetIncidentCard with entered raised limit, invalid limit, keep-paused, applying, authorized/blocked and error states wired through actual host. Existing matrix handlers are no-ops.
+Production: POST /companies/{id}/budget-incidents/{id}/resolve must authorize scope-specific raise, persist resolution and resume eligible work while retaining overlapping budget/manual holds.
+Sources: Source: [BudgetIncidentCard.tsx](../../ui/src/components/BudgetIncidentCard.tsx), [Costs.tsx](../../ui/src/pages/Costs.tsx), [budgets.ts](../../ui/src/api/budgets.ts), [costs.ts](../../server/src/routes/costs.ts), [budgets.ts](../../server/src/services/budgets.ts). Tests: [budgets-service.test.ts](../../server/src/__tests__/budgets-service.test.ts), [Costs.test.tsx](../../ui/src/pages/Costs.test.tsx)

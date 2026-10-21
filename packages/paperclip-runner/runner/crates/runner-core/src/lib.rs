@@ -13,6 +13,7 @@ pub mod claude_managed_provider;
 pub mod codex_provider;
 mod codex_startup_trust;
 mod configured_environment;
+mod credential_observer;
 pub mod dot_provider_backend;
 pub mod durable;
 pub mod fake_harness;

@@ -722,6 +722,9 @@ the runtime. A declarative manifest can suggest public entrypoints and setup req
 new imports keep repository files together and select all discovered skills. Missing
 references, setup problems and omitted files produce persistent warnings. Files rejected
 for unsafe execution or secret disclosure are excluded without blocking other files.
+Oversized repositories use a bounded package of skill folders and referenced files
+with their original paths. Missing references do not block a valid selected skill;
+fallback preserves previously installed shared dependencies or retains the old version.
 The installed file viewer exposes saved repository dependencies. Importing never runs
 setup or configures host tools. New
 upstream skills require reviewed selection; removed or deselected skills remain

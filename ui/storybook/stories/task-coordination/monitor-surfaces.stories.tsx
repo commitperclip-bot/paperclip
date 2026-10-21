@@ -320,6 +320,13 @@ const meta = {
           "Surfaces the pinned monitor banner, composer strip, and IssueProperties Monitor row across the wireframe-04 states (scheduled / retrying / due / overdue / cleared) for UX review.",
       },
     },
+    paperclip: {
+      "capabilities": [
+        "task-coordination/tree-control"
+      ],
+      "implementation": "production",
+      "boundary": "fixtures"
+    },
   },
 } satisfies Meta<typeof MonitorSurfaceStories>;
 

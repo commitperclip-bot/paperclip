@@ -1,3 +1,7 @@
+---
+navigation: {"section":"Tasks and conversations","sectionOrder":20,"order":70}
+---
+
 # Documents, attachments, and work products
 
 People read and revise task documents, annotate specific content, open attached files, and inspect the outputs an agent hands back. The artifact library provides another route to the same work.
@@ -64,3 +68,16 @@ Manual: Find the task’s output through search and grouping, open its stack, pa
 - A local path is not automatically an uploaded artifact accessible to another user.
 - A preview screenshot is not proof that download bytes or revision references are correct.
 - Version conflicts and stale annotations must stay visible rather than silently targeting different content.
+
+### Storybook verification
+
+#### `documents`
+
+Scope: ui
+Storybook: Writable/read-only document, save pending/failure/conflict, revision history/historical preview and restore confirmation.
+Production: Persist edited body and reload; append-only restore creates new revision; reject stale writes and inaccessible company/task.
+Sources: Source: [IssueDocumentsSection.tsx](../../ui/src/components/IssueDocumentsSection.tsx), [TaskDocumentPanel.tsx](../../ui/src/components/task-side-panel/TaskDocumentPanel.tsx), [documents.ts](../../server/src/services/documents.ts). Tests: [IssueDocumentsSection.test.tsx](../../ui/src/components/IssueDocumentsSection.test.tsx), [document-revisions.test.ts](../../ui/src/lib/document-revisions.test.ts), [documents-service.test.ts](../../server/src/__tests__/documents-service.test.ts), [issue-document-restore-routes.test.ts](../../server/src/__tests__/issue-document-restore-routes.test.ts)
+
+### Documentation scope: Artifacts and work products
+
+Document/attachment/library/work-product journeys are mapped; every media preview type, storage backend, annotation conflict, and runtime-resource lifecycle variant remains separate.

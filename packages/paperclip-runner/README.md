@@ -14,6 +14,31 @@ session and issue-thread surfaces, a public browser/React SDK, a standalone
 adapter demo, and a deterministic mock control plane. None of these surfaces
 imports or starts Paperclip's server, UI, CLI, or production database.
 
+## Execution environment lifecycle
+
+`RunnerExecutionDriver` defines the environment hooks shared by coding harnesses
+and external bot harnesses. The server's `createNativeRunnerExecutionDriver`
+supplies this contract for local, SSH, and sandbox execution. Provider-specific
+session setup stays separate from environment selection.
+
+Connection registration prepares remote resources and returns the process's
+connection configuration before launch. Local Runners connect to Core over
+loopback WS. SSH Runners and eligible sandboxes connect to the configured Core
+WSS endpoint. Sandboxes with authorized WebSocket ingress listen inside the
+sandbox; Core connects through the provider endpoint after process dispatch.
+Ingress selection fails closed and does not fall back to outbound WSS.
+
+The returned activation, readiness, failure, checkpoint, and release hooks feed
+the existing shared PRP control plane. PRP owns authentication, commands, replay,
+tool authority, and run transitions. Process ownership hooks provide launch,
+verified adoption, and durable state access. A lost connection does not prove
+process termination, and a required checkpoint failure must prevent lease release.
+
+The driver is an in-process interface. Its filesystem paths and process launch
+specifications are internal to built-in execution; they are not a plugin wire
+contract. Existing flat transport options remain compatible through this shared
+interface. This refactor does not add Launcher APIs or change harness capabilities.
+
 Connection continuations inspect the harness descriptor's optional
 `toolRefreshOnResume` capability. Native Codex, Claude Managed Agents, AgentCore,
 OpenCode, and qualified Claude/Codex/Grok ACPX profiles expose it; unqualified
@@ -66,8 +91,8 @@ are allowed. Relative PATH entries use the selected process working directory.
 Compatibility is established by the actual protocol or login attempt.
 Missing executables and real protocol failures still return actionable errors.
 Package identity and executable containment remain checked. Browser login keeps
-its existing provider-specific credential home. Linux ARM64 retains its existing
-legacy login path because native execution is not qualified there.
+its provider-specific credential home and resolves the installed Codex CLI on
+64-bit Linux and macOS independently of the daemon's libc requirements.
 
 Exact dependency pins remain release and ACPX artifact-qualification checks.
 They make published builds reproducible and verify sandbox artifacts; they do not
@@ -168,7 +193,7 @@ are unavailable. Accepting a native plan ends the planning run successfully whil
 the task waits for the next instruction. See the
 [Cursor release report](../../doc/plans/2026-10-03-cursor-production-readiness.md).
 
-A release includes all three platform daemons and the Linux provider-pack identity
+A release includes all four platform daemons and the Linux provider-pack identity
 from its matching Daytona image. Run `stage:release-binaries` with a manifest that
 binds each daemon path and SHA-256, plus `remoteProviderPack: {path, sha256}` for
 the actual image's `provider-pack.json`. Assemble these assets after the normal
@@ -182,6 +207,68 @@ build still rejects any wrapper that retains its temporary deployment path.
 Ordinary remote Cursor startup uses the packaged Linux daemon and verifies every
 image asset against that manifest. A mismatched image fails before the provider
 starts; install the matching package and image together.
+
+### Native binary platform baseline
+
+Release packages contain Paperclip daemons for `linux-x64`, `linux-arm64`,
+`darwin-arm64`, and `darwin-x64`. Codex native binaries are installed separately
+through the official optional npm platform dependencies described above.
+
+The shipped Linux daemons target **GNU libc 2.39 or newer**, on x86-64 or AArch64.
+Their ELF version requirements include `GLIBC_2.39`; both depend on `libc.so.6`,
+`libm.so.6`, `libgcc_s.so.1`, and the matching GNU dynamic loader. The ARM64
+loader is `/lib/ld-linux-aarch64.so.1`; x64 uses
+`/lib64/ld-linux-x86-64.so.2`. This is a binary compatibility baseline, not a
+promise that every Linux distribution or kernel has been qualified.
+
+Hosted native producers use Ubuntu 24.04 for both Linux architectures. Clean npm
+install checks use the pinned Debian 13 Node image; the cloud Dockerfile uses
+Debian 13 (`node:24-trixie-slim`). macOS binaries build on the existing macOS 15
+Apple Silicon and Intel hosts. Actual task and follow-up acceptance is performed
+on Apple Silicon; Intel qualification covers build, installation, and protocol
+startup.
+
+For sandbox environments, the existing explicit environment probe can measure
+OS, architecture and libc from its allocated lease. It records those facts only
+for an image pinned with `@sha256`, after confirmed lease cleanup. The record is
+server-owned and bound to the company, effective provider/image configuration
+and active custom-image identity. Creation and discovery read this record without
+allocating a sandbox. Configuration or image changes invalidate it. Mutable tags,
+provider defaults and name-only snapshots do not establish compatibility; they
+keep automatic Legacy selection until there is verifiable immutable image evidence.
+A connection-only success does not establish native readiness.
+
+On Linux, Codex's sandboxed filesystem modes also require the host to permit its
+unprivileged namespaces. A no-privilege Docker container can prohibit nested
+namespace creation even when installation and binary compatibility pass.
+Qualification therefore retains the restricted Docker install/lifecycle checks
+and exercises the same installed graph's read-only native startup on the actual
+ARM host. This does not qualify arbitrary container or managed setup targets;
+their selected runtime must pass setup in that environment.
+
+Ubuntu 24.04 also needs system `bubblewrap` and the stock
+`bwrap-userns-restrict` AppArmor profile described in
+[Codex's Linux prerequisites](https://learn.chatgpt.com/docs/sandboxing#prerequisites).
+The qualified ARM64 host uses that distribution helper/profile while retaining
+AppArmor enforcement and global namespace restrictions. Hosted qualification
+materializes authenticated stock package files without running maintainer
+scripts; it verifies native startup and package continuity separately from the
+restricted Docker installation check. This does not prove a normal OS package
+installation journey or a paid provider task on ARM64.
+
+Automatic creation selects legacy execution when a Linux host has musl, unknown
+libc, or a measured GNU libc version below the baseline. Existing agents retain
+their stored runner. Windows, 32-bit ARM, and Alpine/musl native qualification
+remain deferred.
+
+Native release jobs cache Cargo dependencies per platform and OS baseline,
+including compiler, lockfile, and external generated-contract inputs. Workspace
+crates and released binaries are rebuilt and verified every time. Only canonical
+exact-source master pushes may save trusted caches; preview qualification can
+restore them. JavaScript preparation and native compilation run concurrently,
+and both must succeed before artifact metadata and source-bound hashes are
+recorded. Run Docker and native qualification on hosted CI rather than a local
+developer machine.
 
 Pi cold provider admission has an absolute 60-second budget. Warm run attachment
 checkpoints the old ACPX sidecar and starts a new one, so it uses that same budget
@@ -645,3 +732,16 @@ canonical event retained for that command. The header marker `🖇️ v0.1.2`
 identifies the current console iteration.
 
 `create_task` accepts an optional initial `status` of `backlog` or `todo`. Use `backlog` when the user wants a saved task or plan without execution: assignment and the initial plan are committed without scheduling a wake, even when dependencies are already complete. Omitting status preserves immediate delegation (`todo`, or `blocked` for unresolved dependencies).
+
+### Oversized OpenCode events
+
+The OpenCode driver keeps SSE frames up to 1,048,576 characters exact. It compacts longer
+frames while retaining tool identity, status, and bounded output excerpts. This
+also applies when a complete large frame arrives inside one network chunk.
+Canonical tool rows mark shortened output, report its original byte count, and
+do not claim a digest for text that was not retained. A structure that cannot
+fit the compacted bound produces a diagnostic; the event stream continues.
+
+Tool output and error fields have reserved retention space and size records,
+so large input values cannot consume their output tails or make excerpts look
+complete. A separator split between reads does not count against the frame limit.

@@ -2360,6 +2360,62 @@
       "when": 1791837431016,
       "tag": "0338_absurd_vengeance",
       "breakpoints": true
+    },
+    {
+      "idx": 339,
+      "version": "7",
+      "when": 1791903526575,
+      "tag": "0339_luxuriant_iron_monger",
+      "breakpoints": true
+    },
+    {
+      "idx": 340,
+      "version": "7",
+      "when": 1791911743153,
+      "tag": "0340_open_warlock",
+      "breakpoints": true
+    },
+    {
+      "idx": 341,
+      "version": "7",
+      "when": 1791919024567,
+      "tag": "0341_abnormal_bucky",
+      "breakpoints": true
+    },
+    {
+      "idx": 342,
+      "version": "7",
+      "when": 1791921858146,
+      "tag": "0342_dry_shen",
+      "breakpoints": true
+    },
+    {
+      "idx": 343,
+      "version": "7",
+      "when": 1791926375117,
+      "tag": "0343_new_mentor",
+      "breakpoints": true
+    },
+    {
+      "idx": 344,
+      "version": "7",
+      "when": 1791930226792,
+      "tag": "0344_wide_blue_marvel",
+      "breakpoints": true
+    },
+    {
+      "idx": 345,
+      "version": "7",
+      "when": 1791978393174,
+      "tag": "0345_luxuriant_carmella_unuscione",
+      "breakpoints": true
+    },
+    {
+      "idx": 346,
+      "version": "7",
+      "when": 1791989860950,
+      "tag": "0346_cloudy_whiplash",
+      "breakpoints": true
     }
   ]
 }

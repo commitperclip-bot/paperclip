@@ -8,6 +8,7 @@ import { sanitizeRuntimeServiceBaseEnv } from "./runtime-service-env.js";
 import { describeGitAuthFailure, scrubGitCredentialText, type GitRemoteAuthProvider } from "./git-credentials.js";
 import { classifyGitCloneFailure, GitConnectionFailureError, readGitConnectionFailure } from "./git-connection-failure.js";
 import { isWorkspaceGitScanError, WorkspaceGitScanError } from "./workspace-git-operation-scheduler.js";
+import { measureRunPhase } from "./execution-preparation-timing.js";
 
 const execFile = promisify(execFileCallback);
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -34,11 +35,11 @@ export async function materializeManagedProjectWorkspace(
     return { cwd, warning: null };
   }
 
-  const hasAdoptableGitDir = () =>
+  const hasAdoptableGitDir = () => measureRunPhase("workspace.checkout.lookup", () =>
     fs
       .stat(path.resolve(cwd, ".git"))
       .then((entry) => entry.isDirectory())
-      .catch(() => false);
+      .catch(() => false));
   if (await hasAdoptableGitDir()) {
     return { cwd, warning: null };
   }
@@ -55,17 +56,18 @@ export async function materializeManagedProjectWorkspace(
   }
 
   const auth = input.resolveGitAuth && !input.localSource
-    ? await input.resolveGitAuth(input.repoUrl)
+    ? await measureRunPhase("workspace.checkout.git_auth", () => input.resolveGitAuth!(input.repoUrl!))
     : null;
   const cloneTmpDir = await fs.mkdtemp(input.stagingParent
     ? path.join(input.stagingParent, `${path.basename(cwd)}.clone-`)
     : `${cwd}.clone-`);
+  const cloneSource = input.localSource ?? input.repoUrl;
   try {
     await input.beforeCopy?.(cloneTmpDir);
     try {
-      await execFile(
+      await measureRunPhase("workspace.checkout.git_clone", () => execFile(
         "git",
-        [...(auth?.configArgs ?? []), "clone", "--no-hardlinks", "--", input.localSource ?? input.repoUrl, cloneTmpDir],
+        [...(auth?.configArgs ?? []), "clone", "--no-hardlinks", "--", cloneSource, cloneTmpDir],
         {
           env: {
             ...sanitizeRuntimeServiceBaseEnv(process.env),
@@ -74,7 +76,7 @@ export async function materializeManagedProjectWorkspace(
           },
           timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
         },
-      );
+      ));
     } catch (error) {
       const connectionFailure = !input.localSource ? classifyGitCloneFailure(input.repoUrl, error) : null;
       if (connectionFailure) throw new GitConnectionFailureError(
@@ -95,7 +97,7 @@ export async function materializeManagedProjectWorkspace(
       }
       await execFile("git", ["-C", cloneTmpDir, "remote", "set-url", "origin", input.repoUrl], { timeout: 10_000 });
     } else if (input.repoRef) {
-      await execFile("git", ["-C", cloneTmpDir, "checkout", input.repoRef], { timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS });
+      await measureRunPhase("workspace.checkout.git_ref", () => execFile("git", ["-C", cloneTmpDir, "checkout", input.repoRef!], { timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS }));
     }
     await input.beforePublish?.(cloneTmpDir);
   } catch (error) {
@@ -117,7 +119,7 @@ export async function materializeManagedProjectWorkspace(
   }
 
   try {
-    await fs.rename(cloneTmpDir, cwd);
+    await measureRunPhase("workspace.checkout.publish", () => fs.rename(cloneTmpDir, cwd));
   } catch (renameError) {
     await fs
       .rm(cloneTmpDir, { recursive: true, force: true })

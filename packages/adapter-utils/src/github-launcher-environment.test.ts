@@ -23,7 +23,7 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function sandbox(layout: string) {
+async function sandbox(layout: string, concurrent?: boolean) {
   const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-launcher-env-"));
   roots.push(root);
   const bin = path.join(root, layout);
@@ -61,13 +61,119 @@ async function sandbox(layout: string) {
         stdout: result.stdout ?? "", stderr: result.stderr ?? "", pid: null, startedAt };
     }
   };
-  const runner = { execute: vi.fn(execute) };
+  const runner = { allowConcurrentSyncOperations: concurrent, execute: vi.fn(execute) };
   const target = { kind: "remote" as const, transport: "sandbox" as const,
     providerKey: "fixture", remoteCwd: root, runner };
   return { root, bin, remotePath, runner, target };
 }
 
 describe("managed GitHub launcher environment", () => {
+  it("bounds independent remote launcher uploads and preserves the staged environment", async () => {
+    const fixture = await sandbox("tools with 'quotes'/bin", true);
+    const execute = fixture.runner.execute.getMockImplementation()!;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let started = 0;
+    let active = 0;
+    let maximum = 0;
+    fixture.runner.execute.mockImplementation(async (input) => {
+      if (!input.stdin) return execute(input);
+      started += 1;
+      active += 1;
+      maximum = Math.max(maximum, active);
+      try {
+        await gate;
+        return await execute(input);
+      } finally { active -= 1; }
+    });
+    const preparation = prepareGitHubOperationLaunchers({
+      runId: "bounded-staging", target: fixture.target, cwd: fixture.root,
+      env: githubBrokerEnvironment({ PATH: fixture.remotePath }, { url: "", token: "" }),
+    });
+    try {
+      await vi.waitFor(() => expect(started).toBe(3));
+      expect(active).toBe(3);
+    } finally { release(); await preparation; }
+    const env = await preparation;
+    expect(maximum).toBe(3);
+    expect(active).toBe(0);
+    expect(started).toBe(9);
+    expect(env.PATH).toBe(`${env.PAPERCLIP_GITHUB_LAUNCHER_DIR}:${fixture.remotePath}`);
+    const command = await fixture.runner.execute({ command: "bash", args: ["--noprofile", "--norc", "-c", "git; gh"], env });
+    expect(command.exitCode, command.stderr).toBe(0);
+    expect(command.stdout).toBe("git started\ngh started\n");
+    for (const name of [".profile", ".bash_profile", ".bashrc", ".zshenv", ".zprofile", ".zshrc"]) {
+      const script = await readFile(path.join(env.PAPERCLIP_GITHUB_LAUNCHER_DIR, name), "utf8");
+      const result = await fixture.runner.execute({ command: "sh", args: ["-c", `${script}\nprintf '%s' "$PATH"`] });
+      expect(result.exitCode, result.stderr).toBe(0);
+      expect(result.stdout).toBe(env.PATH);
+    }
+  });
+
+  it("settles failed upload batches before rejecting and starting no later files", async () => {
+    const fixture = await sandbox("usr/bin", true);
+    const execute = fixture.runner.execute.getMockImplementation()!;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let started = 0;
+    let active = 0;
+    let settled = false;
+    fixture.runner.execute.mockImplementation(async (input) => {
+      if (!input.stdin) return execute(input);
+      const index = started++;
+      active += 1;
+      try {
+        if (index === 0) return { exitCode: 42, signal: null, timedOut: false, pid: null,
+          startedAt: new Date().toISOString(), stdout: "", stderr: "fixture upload failed" };
+        await gate;
+        return await execute(input);
+      } finally { active -= 1; }
+    });
+    const preparation = prepareGitHubOperationLaunchers({
+      runId: "failed-batch", target: fixture.target, cwd: fixture.root, env: { PATH: fixture.remotePath },
+    });
+    const outcome = preparation.then(() => { settled = true; return null; }, (error: unknown) => { settled = true; return error; });
+    try {
+      await vi.waitFor(() => expect(started).toBe(3));
+      expect(settled).toBe(false);
+      expect(active).toBe(2);
+    } finally { release(); await outcome; }
+    expect(await outcome).toBeInstanceOf(Error);
+    expect(String(await outcome)).toContain("stage GitHub operation launcher");
+    expect(started).toBe(3);
+    expect(active).toBe(0);
+    expect(fixture.runner.execute.mock.calls.some(([input]) => input.args?.join(" ").startsWith("chmod 700"))).toBe(false);
+  });
+
+  it("keeps concurrent staging of the same remote launcher directory coherent", async () => {
+    const fixture = await sandbox("usr/bin", true);
+    const input = { runId: "same-directory", target: fixture.target, cwd: fixture.root,
+      env: githubBrokerEnvironment({ PATH: fixture.remotePath }, { url: "", token: "" }) };
+    const [first, second] = await Promise.all([prepareGitHubOperationLaunchers(input), prepareGitHubOperationLaunchers(input)]);
+    expect(first).toEqual(second);
+    const command = await fixture.runner.execute({ command: "bash", args: ["--noprofile", "--norc", "-c", "git; gh"], env: second });
+    expect(command.exitCode, command.stderr).toBe(0);
+    expect(command.stdout).toBe("git started\ngh started\n");
+    expect(await readFile(path.join(first.PAPERCLIP_GITHUB_LAUNCHER_DIR, "package.json"), "utf8")).toBe('{"type":"commonjs"}\n');
+  });
+
+  it.each([undefined, false])("keeps providers without a concurrent capability serial (%s)", async (concurrent) => {
+    const fixture = await sandbox("usr/bin", concurrent);
+    const execute = fixture.runner.execute.getMockImplementation()!;
+    let active = 0;
+    let maximum = 0;
+    fixture.runner.execute.mockImplementation(async (input) => {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      try { return await execute(input); } finally { active -= 1; }
+    });
+    await prepareGitHubOperationLaunchers({ runId: "serial-provider", target: fixture.target,
+      cwd: fixture.root, env: { PATH: fixture.remotePath } });
+    expect(maximum).toBe(1);
+    expect(active).toBe(0);
+    expect(fixture.runner.execute).toHaveBeenCalledTimes(10);
+  });
+
   // The Daytona native directory oracle uses Linux inotify. Run its real
   // filesystem regression on that platform; shell/launcher tests cover both.
   it.runIf(process.platform === "linux")("keeps launcher restaging and command scratch inside the runner runtime", async () => {

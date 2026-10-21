@@ -1,34 +1,44 @@
+import type { RunnerExecutionDriver } from "../../control-plane/runner-execution-driver.js";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import type { HarnessDriver, HarnessDriverDescriptor, HarnessSession, OpenHarnessSessionInput, PersistedHarnessSession } from "../../contracts/harness-driver.js";
 import type { NativeExecutionInputV6 } from "../../contracts/native-execution.js";
-import type { ExternalProviderPort } from "../../contracts/external-provider.js";
+import type { ExternalProviderPort, ExternalBotProviderKind } from "../../contracts/external-provider.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
 import { validatePrpStructuredRunResult } from "../../protocol/replay-contract.js";
 import { DurablePrpControlPlane, spawnRunner, type RunnerProcessHandle } from "../../control-plane/durable-prp-control-plane.js";
 import type { DurableRecoveryIdentity } from "../../contracts/durable-recovery.js";
-import { authorizedToolSetForProvider, defaultCapabilityRunnerdBinary, readRunnerdArtifactBinding, type CapabilityRunnerdCodexTransportOptions } from "../../live/runnerd-codex-transport.js";
+import { authorizedToolSetForProvider, defaultCapabilityRunnerdBinary, readRunnerdArtifactBinding } from "../../live/runnerd-codex-transport.js";
 import { codexSemanticToolSpecs } from "../codex/codex-driver-values.js";
 import { nativeSystemInstructions } from "../../backends/runtime-context.js";
 import type { CodexNativeSessionBackendOptions } from "../../backends/codex-native-backend.js";
 
-export interface RunnerdDotDriverOptions {
+export interface RunnerdDotDriverOptions extends Pick<RunnerExecutionDriver, "runnerStateDirectory" | "runnerProcessLauncher" | "controlPlaneRegistration" | "adoptExistingRunner"> {
   execution: NativeExecutionInputV6;
   stateDirectory: string;
   identity: DurableRecoveryIdentity;
   port: ExternalProviderPort;
   runnerBinary?: string;
-  runnerStateDirectory?: string;
-  runnerProcessLauncher?: CapabilityRunnerdCodexTransportOptions["runnerProcessLauncher"];
   /** Reads the checkpoint from the execution target. Missing state cannot authorize replay. */
   readProviderState?: () => Promise<Record<string, unknown> | null>;
-  controlPlaneRegistration?: CapabilityRunnerdCodexTransportOptions["controlPlaneRegistration"];
   onSpawn?: CodexNativeSessionBackendOptions["onSpawn"];
   dynamicTools?: CodexNativeSessionBackendOptions["dynamicTools"];
   dynamicToolHandler?: CodexNativeSessionBackendOptions["dynamicToolHandler"];
   completionFeedback?: CodexNativeSessionBackendOptions["completionFeedback"];
-  adoptExistingRunner?: CapabilityRunnerdCodexTransportOptions["adoptExistingRunner"];
+}
+
+/** Keep the remote monitor's closed failure code without logging its stderr,
+ * which can contain private transport details. */
+export function externalRunnerExitMessage(result: Awaited<RunnerProcessHandle["completion"]>): string {
+  const diagnostics = result.stderr ?? "";
+  const reasons = [
+    ["transport_reconnect_grace_exceeded", "transport reconnect grace exceeded"],
+    ["transport_reconnect_deadline_exceeded", "transport reconnect deadline elapsed"],
+    ["lease_expired_requires_bootstrap", "connection lease expired"],
+  ] as const;
+  const reason = reasons.find(([code, message]) => diagnostics.includes(code) || diagnostics.includes(message))?.[0];
+  return `dot_runner_process_exited_recovery_required: code=${result.code} signal=${result.signal}${reason ? ` reason=${reason}` : ""}`;
 }
 
 const capabilities = {
@@ -37,17 +47,22 @@ const capabilities = {
   dynamicTools: true, unsupported: ["resume", "steering", "interruption", "usage", "goals", "runtimeRequestResolution", "threadLineage"],
 };
 
-/** The admission path can inspect Dot without allocating a broker port or Runner. */
+/** Inspect external capabilities without allocating a broker port or Runner. */
+export function describeRunnerdExternalBotDriver(provider: ExternalBotProviderKind): HarnessDriverDescriptor {
+  const grok = provider === "grok_bot";
+  return { kind: grok ? "grok_bot_mcp" : "openai_dot_mcp", displayName: grok ? "Grok Bot" : "OpenAI Dot", version: grok ? "grok-bot-mcp-v1" : "dot-mcp-v1", protocolVersion: "prp.v3",
+    capabilities: { ...structuredClone(capabilities), completionBoundary: "paperclip_work_session", providerTermination: "unavailable", providerTranscriptStreaming: false }, runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" } };
+}
+
 export function describeRunnerdDotDriver(): HarnessDriverDescriptor {
-  return { kind: "openai_dot_mcp", displayName: "OpenAI Dot", version: "dot-mcp-v1", protocolVersion: "prp.v3",
-    capabilities: structuredClone(capabilities), runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" } };
+  return describeRunnerdExternalBotDriver("openai_dot");
 }
 
 /** Thin SDK projection. Rust owns every lifecycle decision and durable receipt. */
 export class RunnerdDotDriver implements HarnessDriver {
   constructor(readonly options: RunnerdDotDriverOptions) {}
   async descriptor() {
-    return describeRunnerdDotDriver();
+    return describeRunnerdExternalBotDriver(this.options.execution.provider.kind);
   }
   async openSession(input: OpenHarnessSessionInput): Promise<HarnessSession> {
     if (input.runId !== this.options.identity.runId || input.normalizedSessionId !== this.options.identity.normalizedSessionId) {
@@ -59,14 +74,18 @@ export class RunnerdDotDriver implements HarnessDriver {
     catch (error) { await session.detachControllerForRestart().catch(() => {}); throw error; }
   }
   async recoverSession(snapshot: PersistedHarnessSession, options: { signal: AbortSignal }) {
-    if (snapshot.driverKind !== "openai_dot_mcp" || snapshot.runId !== this.options.identity.runId
+    if (snapshot.driverKind !== describeRunnerdExternalBotDriver(this.options.execution.provider.kind).kind || snapshot.runId !== this.options.identity.runId
         || snapshot.driverSessionId !== this.options.identity.normalizedSessionId || snapshot.providerSessionId != null) {
       return { recovered: false, reason: "Dot bridge checkpoint identity mismatch" };
     }
     let saved: Record<string, unknown> | null;
     try { saved = await readProviderCheckpoint(this.options); }
     catch { return { recovered: false, reason: "Dot bridge checkpoint invalid; external work requires reconciliation" }; }
-    if (!saved) return { recovered: false, reason: "Dot bridge checkpoint missing; external work requires reconciliation" };
+    if (!saved) return { recovered: false, reason: "External bridge checkpoint missing; external work requires reconciliation" };
+    const descriptor = saved.descriptor as Record<string, unknown> | undefined;
+    if (this.options.execution.provider.kind === "grok_bot" && descriptor?.kind !== "grok_bot") {
+      return { recovered: false, reason: "External bridge checkpoint provider mismatch" };
+    }
     if (saved.schema !== "paperclip.runner.dot-provider-state.v1" || saved.runId !== snapshot.runId || saved.sessionId !== snapshot.driverSessionId || saved.turnId !== this.options.identity.turnId) {
       return { recovered: false, reason: "Dot bridge checkpoint authority mismatch" };
     }
@@ -83,6 +102,11 @@ async function readProviderCheckpoint(options: RunnerdDotDriverOptions): Promise
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
+export function runnerDisconnectDiagnostic(core: Pick<DurablePrpControlPlane, "runnerDisconnectedForMs">): string {
+  const disconnectedMs = core.runnerDisconnectedForMs();
+  return `disconnectedMs=${disconnectedMs ?? "none"}`;
+}
+
 class RunnerdDotSession implements HarnessSession {
   #core: DurablePrpControlPlane | null = null;
   #process: RunnerProcessHandle | null = null;
@@ -93,7 +117,7 @@ class RunnerdDotSession implements HarnessSession {
   #closed = false;
   #failure: Error | null = null;
   constructor(readonly options: RunnerdDotDriverOptions) {}
-  ids() { return { driverSessionId: this.options.identity.normalizedSessionId, providerSessionId: null, displayId: "OpenAI Dot" }; }
+  ids() { return { driverSessionId: this.options.identity.normalizedSessionId, providerSessionId: null, displayId: describeRunnerdExternalBotDriver(this.options.execution.provider.kind).displayName }; }
 
   async open(signal?: AbortSignal) {
     const o = this.options;
@@ -159,11 +183,13 @@ class RunnerdDotSession implements HarnessSession {
         // Remote monitors do not report an exit code. The authenticated,
         // persisted receipt is the evidence of shutdown, for either launcher.
         if (core.getCommand("dot_shutdown")?.status === "completed") return;
-        this.#failure ??= new Error(`dot_runner_process_exited_recovery_required: code=${result.code} signal=${result.signal}`);
+        // Retain closed remote-monitor codes and the controller's safe
+        // disconnect age; raw stderr must never reach the run failure message.
+        this.#failure ??= new Error(`${externalRunnerExitMessage(result)} ${runnerDisconnectDiagnostic(core)}`);
         this.#wake();
       }, () => {
         if (this.#closed || core.getCommand("dot_shutdown")?.status === "completed") return;
-        this.#failure ??= new Error("dot_runner_process_exited_recovery_required");
+        this.#failure ??= new Error(`dot_runner_process_exited_recovery_required: ${runnerDisconnectDiagnostic(core)}`);
         this.#wake();
       });
     } else if (!await o.adoptExistingRunner.isAlive()) { throw new Error("dot_runner_adoption_failed"); }
@@ -179,12 +205,16 @@ class RunnerdDotSession implements HarnessSession {
     if (checkpoint && (checkpoint.schema !== "paperclip.runner.dot-provider-state.v1"
       || checkpoint.runId !== o.identity.runId || checkpoint.sessionId !== o.identity.normalizedSessionId
       || checkpoint.turnId !== o.identity.turnId)) throw new Error("dot_runner_checkpoint_authority_mismatch");
+    if (checkpoint && o.execution.provider.kind === "grok_bot"
+      && (checkpoint.descriptor as Record<string, unknown> | undefined)?.kind !== "grok_bot") {
+      throw new Error("external_provider_checkpoint_provider_mismatch");
+    }
     this.#detachPort = await o.port.attach(async operation => {
       await this.#command("external_provider.operation", { ...operation }, `dot_operation_${operation.requestId}`);
     }, () => this.interrupt(), !!checkpoint);
     await this.#command("run.prepare", {
-      provider: { kind: "openai_dot", ...o.execution.provider.binding,
-        instructions: `${nativeSystemInstructions(o.execution)}\n\nAccept the assignment before calling tools. Invoke paperclip_finish or paperclip_block, then submit the same structured result with paperclip_dot_finish. Keep request IDs stable across retries.` },
+      provider: { kind: o.execution.provider.kind, ...o.execution.provider.binding,
+        instructions: `${nativeSystemInstructions(o.execution)}\n\nAccept the assignment before calling tools. Invoke paperclip_finish or paperclip_block, then submit the same structured result with ${o.execution.provider.kind === "grok_bot" ? "paperclip_grok_finish" : "paperclip_dot_finish"}. Keep request IDs stable across retries.` },
       authorizedTools: authorizedToolSetForProvider(undefined, [...o.dynamicTools ?? [], ...codexSemanticToolSpecs()]),
       completionContract: { revision: o.execution.completionContract.contract.revision,
         criterionIds: o.execution.completionContract.contract.criteria.map(c => c.id) },
@@ -238,7 +268,7 @@ class RunnerdDotSession implements HarnessSession {
     const proposed = this.#events.findLast(event => event.eventType === "run.result.proposed");
     const result = proposed ? validatePrpStructuredRunResult(proposed.payload) : null;
     const terminal = this.#events.findLast(event => event.eventType === "run.terminal");
-    return { driverKind: "openai_dot_mcp", driverSessionId: this.ids().driverSessionId,
+    return { driverKind: describeRunnerdExternalBotDriver(this.options.execution.provider.kind).kind, driverSessionId: this.ids().driverSessionId,
       providerSessionId: null, runId: this.options.identity.runId,
       normalizedSessionId: this.options.identity.normalizedSessionId,
       activeTurnId: typeof state.activeProviderTurnId === "string" ? state.activeProviderTurnId : null,

@@ -239,6 +239,7 @@ export type {
   PluginLocalFoldersClient,
   PluginEventsClient,
   ResourceLifecycleEvent,
+  ResourceLifecycleResult,
   PluginJobsClient,
   PluginLaunchersClient,
   PluginHttpClient,

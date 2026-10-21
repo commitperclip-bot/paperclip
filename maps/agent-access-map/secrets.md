@@ -2,7 +2,9 @@
 
 Product map: [Secrets, personal credentials, and proposals](../feature-map/secrets.md).
 
-Review date: 2026-10-12. Source commit: `f981fa3cc10cb8663a87dec60345fbff46d54d0a`.
+Review date: 2026-10-12. Source commit: `58e16dbddfc9c8d0cf60867f9d9847f0feda055b`.
+Native REST transport reconciled in this change; see the
+[shared transport contract](README.md#native-rest-transport).
 
 This is a source-reviewed baseline of representative operations and known gaps.
 Each capability needs operation-level review before its entire scope can be
@@ -18,8 +20,8 @@ API: `present` — representative operation IDs:
 - `GET /api/companies/{companyId}/secrets/catalog`.
 - `POST /api/companies/{companyId}/secrets`.
 
-Agent access: `partial` — Agent metadata catalog; board secret administration; agent
-secret proposal API.
+Agent access: `partial` — Agent REST / native `call_api` metadata catalog and secret
+proposals; company secret administration remains board-only.
 
 Policy: Board secret administration, active-run/self/report proposal policy, and scoped
 secret broker bindings; personal secret values belong to their user.
@@ -32,8 +34,8 @@ credentials/run context; inspect its result and applicable persistence/attributi
 Assert the relevant denied actor, owner, company or mode from Policy. Review the
 remaining operations before qualifying the whole capability.
 
-Gaps: Metadata and requesting a change exist; generic native API blocks secret
-management/value transport.
+Gaps: Native transport preserves board-only administration. Bound value retrieval
+is a separate scoped operation described under runtime-delivery.
 
 ## `user-secrets`
 
@@ -69,8 +71,8 @@ API: `present` — representative operation IDs:
 - `POST /api/agents/me/secret-proposals`.
 - `GET /api/agents/me/secret-proposals`.
 
-Agent access: `partial` — Active-run agent REST with redaction; board
-approval/rejection.
+Agent access: `partial` — Active-run agent REST / native `call_api` with redaction;
+approval/rejection remains board-only.
 
 Policy: Board secret administration, active-run/self/report proposal policy, and scoped
 secret broker bindings; personal secret values belong to their user.
@@ -83,8 +85,8 @@ credentials/run context; inspect its result and applicable persistence/attributi
 Assert the relevant denied actor, owner, company or mode from Policy. Review the
 remaining operations before qualifying the whole capability.
 
-Gaps: Native call_api blocks secret-proposals and no dedicated production proposal tool
-is in its default authority set.
+Gaps: No dedicated production proposal tool is required for the REST path.
+Native calls retain active-run, scope and skill-test JWT restrictions.
 
 ## `vault-import`
 
@@ -120,8 +122,8 @@ API: `present` — representative operation IDs:
 - `GET /api/agents/me/secrets`.
 - `POST /api/agents/me/secrets/{key}/value`.
 
-Agent access: `partial` — Authorized environment/broker delivery; eligible legacy agent
-REST access.
+Agent access: `available` — Authorized environment/broker delivery and scoped agent
+REST / native `call_api` value retrieval.
 
 Policy: Board secret administration, active-run/self/report proposal policy, and scoped
 secret broker bindings; personal secret values belong to their user.
@@ -134,5 +136,13 @@ credentials/run context; inspect its result and applicable persistence/attributi
 Assert the relevant denied actor, owner, company or mode from Policy. Review the
 remaining operations before qualifying the whole capability.
 
-Gaps: Native metadata reads exist; value call is blocked and scenario read_secret_value
-is unbound. Do not add raw secret-returning fallback tools.
+Server-only instance secrets are excluded from this path. They belong to the
+company, owning agent, and installed lifecycle plugin. The existing local lifecycle
+callback can save them through the native secret service; there is no agent API
+for their values. Source: [native secret coordinator](../../server/src/services/agent-instance-secrets.ts)
+and [scope/denial tests](../../server/src/__tests__/agent-instance-secrets.test.ts).
+No live agent execution is claimed for this exclusion.
+
+Gaps: Values remain restricted to the bound agent and active run. Credential
+responses stay inline and use encrypted mutation receipts; they are not saved as
+plaintext response assets. Dedicated scenario read_secret_value remains unbound.
