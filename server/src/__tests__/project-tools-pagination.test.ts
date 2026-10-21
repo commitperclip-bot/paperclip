@@ -21,6 +21,26 @@ describe("project discovery result bounds", () => {
       .toMatchObject({ properties: { cursor: expect.any(Object), limit: expect.any(Object) } });
   });
 
+  it.each([
+    [{ status: "backlog" }, "backlog"],
+    [{}, "todo"],
+    [{ status: "todo" }, "todo"],
+    [{ blockedByTaskIds: ["abcdefab-0000-4000-8000-000000000002"] }, "blocked"],
+    [{ status: "backlog", blockedByTaskIds: ["abcdefab-0000-4000-8000-000000000002"] }, "backlog"],
+  ])("create_task with %j sends status %s", async (extra, status) => {
+    const fetch = vi.fn(async (_url: string, _options: RequestInit) => ({ ok: true, json: async () => ({}) }));
+    vi.stubGlobal("fetch", fetch);
+    await callProjectTool({ ...input, name: "create_task", agentId: "abcdefab-0000-4000-8000-000000000003", issueId: "abcdefab-0000-4000-8000-000000000004", arguments: { title: "T", idempotencyKey: "k", ...extra } });
+    expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)).status).toBe(status);
+  });
+
+  it("rejects unsupported create_task status before fetching", async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    await expect(callProjectTool({ ...input, name: "create_task", arguments: { title: "T", idempotencyKey: "k", status: "done" } })).rejects.toThrow();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it.each([{ limit: 0 }, { limit: 51 }, { cursor: "invalid" }])("rejects invalid paging arguments %j before fetching", async (arguments_) => {
     const fetch = vi.fn();
     vi.stubGlobal("fetch", fetch);
