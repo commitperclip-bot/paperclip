@@ -565,6 +565,65 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
             VALUES ('carrier-pigeon', int4range(10, 20))
           `),
         ).rejects.toThrow("tool_connections_transport_check");
+        await expect(
+          restoreSql.unsafe(`
+            INSERT INTO "check_fixture"."tool_connections" ("transport", "slot")
+            VALUES ('http', int4range(3, 8))
+          `),
+        ).rejects.toThrow("tool_connections_slot_excl");
+      } finally {
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "schema-qualifies check constraint functions when the source search_path differs from the target",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_check_search_path_target",
+      );
+      const sourceDatabaseName = new URL(sourceConnectionString).pathname.slice(1);
+      const backupDir = createTempDir("paperclip-db-check-search-path-backup-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE SCHEMA "app";
+          CREATE TABLE "app"."settings" ("id" integer PRIMARY KEY);
+          CREATE FUNCTION "app"."allowed"(value text) RETURNS boolean
+            LANGUAGE sql IMMUTABLE AS $$ SELECT value <> 'blocked' $$;
+          CREATE TABLE "public"."guarded_values" (
+            "id" serial PRIMARY KEY,
+            "value" text NOT NULL,
+            CONSTRAINT "guarded_values_value_check" CHECK ("app"."allowed"("value"))
+          );
+          INSERT INTO "public"."guarded_values" ("value") VALUES ('ok');
+          ALTER DATABASE "${sourceDatabaseName}" SET search_path = app, public;
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-check-search-path-test",
+          backupEngine: "javascript",
+        });
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+        });
+
+        expect(await restoreSql`SELECT value FROM public.guarded_values`).toEqual([{ value: "ok" }]);
+        await expect(
+          restoreSql`INSERT INTO public.guarded_values (value) VALUES ('blocked')`,
+        ).rejects.toThrow("guarded_values_value_check");
       } finally {
         await sourceSql.end();
         await restoreSql.end();

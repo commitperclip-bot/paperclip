@@ -1000,24 +1000,30 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     }
 
     // CHECK and exclusion constraints are added after the data load, using the
-    // server's own definition so expressions and NOT VALID are preserved.
-    const allCheckAndExclusionConstraints = await sql<{
-      constraint_name: string;
-      schema_name: string;
-      tablename: string;
-      definition: string;
-    }[]>`
-      SELECT c.conname AS constraint_name,
-             n.nspname AS schema_name,
-             t.relname AS tablename,
-             pg_get_constraintdef(c.oid) AS definition
-      FROM pg_constraint c
-      JOIN pg_class t ON t.oid = c.conrelid
-      JOIN pg_namespace n ON n.oid = t.relnamespace
-      WHERE c.contype IN ('c', 'x')
-        AND ${sql.unsafe(nonSystemSchemaPredicate("n.nspname"))}
-      ORDER BY n.nspname, t.relname, c.conname
-    `;
+    // server's own definition so expressions and NOT VALID are preserved. Read
+    // the definitions with only pg_catalog on the search path so user-defined
+    // functions, types and operators are schema-qualified and the restore does
+    // not depend on the target role's search_path.
+    const allCheckAndExclusionConstraints = await sql.begin(async (tx) => {
+      await tx`SET LOCAL search_path = pg_catalog`;
+      return tx<{
+        constraint_name: string;
+        schema_name: string;
+        tablename: string;
+        definition: string;
+      }[]>`
+        SELECT c.conname AS constraint_name,
+               n.nspname AS schema_name,
+               t.relname AS tablename,
+               pg_get_constraintdef(c.oid) AS definition
+        FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        WHERE c.contype IN ('c', 'x')
+          AND ${tx.unsafe(nonSystemSchemaPredicate("n.nspname"))}
+        ORDER BY n.nspname, t.relname, c.conname
+      `;
+    });
     const checkAndExclusionConstraints = allCheckAndExclusionConstraints.filter((entry) => (
       includedTableNames.has(tableKey(entry.schema_name, entry.tablename))
     ));
