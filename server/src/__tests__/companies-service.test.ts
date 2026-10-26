@@ -12,9 +12,11 @@ import {
   companySkillVersions,
   companySkills,
   companyMemberships,
+  costEvents,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  inboxDismissals,
   issues,
   principalPermissionGrants,
   routines,
@@ -94,6 +96,29 @@ describeEmbeddedPostgres("companyService", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
+  });
+
+  it("removes a company that has cost events and inbox dismissals", async () => {
+    const [company] = await db.insert(companies).values({ name: "Used company", issuePrefix: "USD" }).returning();
+    const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Worker" }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id }).returning();
+    await db.insert(costEvents).values({
+      companyId: company.id,
+      agentId: agent.id,
+      heartbeatRunId: run.id,
+      provider: "anthropic",
+      model: "test-model",
+      costCents: 5,
+      occurredAt: new Date(),
+    });
+    await db.insert(inboxDismissals).values({ companyId: company.id, userId: "user-1", itemKey: "item-1" });
+
+    const removed = await companyService(db).remove(company.id);
+
+    expect(removed?.id).toBe(company.id);
+    expect(await db.select().from(companies).where(eq(companies.id, company.id))).toHaveLength(0);
+    expect(await db.select().from(inboxDismissals).where(eq(inboxDismissals.companyId, company.id))).toHaveLength(0);
+    expect(await db.select().from(costEvents).where(eq(costEvents.companyId, company.id))).toHaveLength(0);
   });
 
   it("retries generated issue prefixes when Drizzle wraps the unique constraint error", async () => {
