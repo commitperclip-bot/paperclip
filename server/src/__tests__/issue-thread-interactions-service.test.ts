@@ -2077,6 +2077,64 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       .toBe("pending");
   });
 
+  it("supersedes an agent's own older pending ask_user_questions only for the same addressee", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Questions to different addressees");
+    const creatorAgentId = randomUUID();
+    const firstAddresseeAgentId = randomUUID();
+    const secondAddresseeAgentId = randomUUID();
+    await db.insert(agents).values([
+      activeCodexAgentRow(creatorAgentId, companyId, "Creator", "engineer"),
+      activeCodexAgentRow(firstAddresseeAgentId, companyId, "First addressee", "engineer"),
+      activeCodexAgentRow(secondAddresseeAgentId, companyId, "Second addressee", "engineer"),
+    ]);
+
+    const question = (prompt: string, addresseeAgentId?: string) => ({
+      kind: "ask_user_questions" as const,
+      resolverPolicy: "board_or_agents" as const,
+      ...(addresseeAgentId ? { addresseeAgentId } : {}),
+      payload: {
+        version: 1 as const,
+        questions: [{
+          id: "q",
+          prompt,
+          selectionMode: "single" as const,
+          options: [{ id: "opt", label: "Option" }],
+        }],
+      },
+    });
+
+    const toFirst = await interactionsSvc.create(
+      { id: issueId, companyId }, question("Question for first", firstAddresseeAgentId), { agentId: creatorAgentId },
+    );
+    const unaddressed = await interactionsSvc.create(
+      { id: issueId, companyId }, question("Unaddressed question"), { agentId: creatorAgentId },
+    );
+    const toSecond = await interactionsSvc.create(
+      { id: issueId, companyId }, question("Question for second", secondAddresseeAgentId), { agentId: creatorAgentId },
+    );
+
+    let interactions = await interactionsSvc.listForIssue(issueId);
+    expect(interactions.find((interaction) => interaction.id === toFirst.id)?.status).toBe("pending");
+    expect(interactions.find((interaction) => interaction.id === unaddressed.id)?.status).toBe("pending");
+    expect(interactions.find((interaction) => interaction.id === toSecond.id)?.status).toBe("pending");
+
+    const replacementToFirst = await interactionsSvc.create(
+      { id: issueId, companyId }, question("Newer question for first", firstAddresseeAgentId), { agentId: creatorAgentId },
+    );
+
+    interactions = await interactionsSvc.listForIssue(issueId);
+    expect(interactions.find((interaction) => interaction.id === toFirst.id)).toMatchObject({
+      status: "expired",
+      result: {
+        expirationReason: "superseded_by_newer_interaction",
+        supersededByInteractionId: replacementToFirst.id,
+      },
+    });
+    expect(interactions.find((interaction) => interaction.id === replacementToFirst.id)?.status).toBe("pending");
+    expect(interactions.find((interaction) => interaction.id === unaddressed.id)?.status).toBe("pending");
+    expect(interactions.find((interaction) => interaction.id === toSecond.id)?.status).toBe("pending");
+  });
+
   it("leaves exactly one pending ask_user_questions on the onboarding first task after probe cards and the real question arrive", async () => {
     const companyId = randomUUID();
     const goalId = randomUUID();
@@ -2231,6 +2289,53 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
     expect(interactions.find((interaction) => interaction.id === secondAgentIds[1])?.status).toBe("pending");
     expect(interactions.find((interaction) => interaction.id === checkboxId)?.status).toBe("pending");
+  });
+
+  it("does not sweep pending confirmations from the same agent to different addressees", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Historical confirmation sweep by addressee");
+    const creatorAgentId = randomUUID();
+    const addresseeAgentId = randomUUID();
+    await db.insert(agents).values([
+      activeCodexAgentRow(creatorAgentId, companyId, "Creator", "engineer"),
+      activeCodexAgentRow(addresseeAgentId, companyId, "Addressee", "engineer"),
+    ]);
+
+    const addressedId = randomUUID();
+    const unaddressedId = randomUUID();
+    await db.insert(issueThreadInteractions).values([
+      {
+        id: addressedId,
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: creatorAgentId,
+        addresseeAgentId,
+        payload: { version: 1 as const, prompt: "Addressed draft" },
+        createdAt: new Date("2026-07-01T12:00:00.000Z"),
+        updatedAt: new Date("2026-07-01T12:00:00.000Z"),
+      },
+      {
+        id: unaddressedId,
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: creatorAgentId,
+        payload: { version: 1 as const, prompt: "Unaddressed draft" },
+        createdAt: new Date("2026-07-01T12:01:00.000Z"),
+        updatedAt: new Date("2026-07-01T12:01:00.000Z"),
+      },
+    ]);
+
+    await expect(interactionsSvc.sweepSupersededPendingRequestConfirmations())
+      .resolves.toEqual({ expired: 0 });
+
+    const interactions = await interactionsSvc.listForIssue(issueId);
+    expect(interactions.find((interaction) => interaction.id === addressedId)?.status).toBe("pending");
+    expect(interactions.find((interaction) => interaction.id === unaddressedId)?.status).toBe("pending");
   });
 
   it("refuses to create an interaction on a closed issue", async () => {
