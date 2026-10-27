@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { createDatabaseResponseCapture, installDatabaseResponseCapture } from "@paperclipai/db/response-capture";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRuns, issueRecoveryActions, issues, projects } from "@paperclipai/db";
+import { agents, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRuns, issueRecoveryActions, issues, projects, workspaceOperations } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { recordLegacyWorkspaceRestoreFailure, legacyExecutionNeedsReconciliationWithEvidence, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { hasConversationContinuationPolicy, conversationRecoveryActionPredicate } from "../services/conversation-continuation.js";
@@ -71,6 +71,24 @@ const support = externalTestDatabaseUrl ? { supported: true } : await getEmbedde
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId)))
       .toEqual([expect.objectContaining({ evidence: expect.objectContaining({ runId: f.runId }), ownerType: "board" })]);
     expect(JSON.stringify(events)).not.toContain(bulk.slice(0, 64));
+  });
+
+  it("terminalizes while an open child insert holds foreign-key locks on the run and issue", async () => {
+    const f = await seed();
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    let markInserted!: () => void;
+    const inserted = new Promise<void>(resolve => { markInserted = resolve; });
+    const holder = db.transaction(async tx => {
+      await tx.insert(workspaceOperations).values({ companyId: f.companyId, heartbeatRunId: f.runId, issueId: f.issueId, phase: "worktree_cleanup" });
+      markInserted();
+      await released;
+    });
+    await Promise.race([inserted, holder]);
+    try {
+      expect(await terminalizeLegacyExecution({ db, run: f.run, status: "failed", patch })).toMatchObject({ id: f.runId, status: "failed" });
+    } finally { release(); await holder; }
+    expect(await db.select().from(workspaceOperations).where(eq(workspaceOperations.heartbeatRunId, f.runId))).toHaveLength(1);
   });
 
   it("preserves pending and acknowledged status delivery on unpatched legacy recovery retries", async () => {

@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { and, asc, eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, chatCompletionDeliveries as deliveries, chatTaskHandoffs as handoffs,
-  companies, createDb, documents, environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issues } from "@paperclipai/db";
+  companies, createDb, documents, environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issues, workspaceOperations } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { settleInterruptedNativeBootstrap, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
@@ -234,6 +234,25 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.sourceId))).toMatchObject([
       { status: "resolved", outcome: "false_positive" },
     ]);
+  });
+  it("settles a pre-provider shutdown while an open child insert holds foreign-key locks on the run and issue", async () => {
+    const { f, run } = await interruptedBootstrap();
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    let markInserted!: () => void;
+    const inserted = new Promise<void>(resolve => { markInserted = resolve; });
+    const holder = db.transaction(async tx => {
+      await tx.insert(workspaceOperations).values({ companyId: f.companyId, heartbeatRunId: run.id, issueId: f.sourceId, phase: "worktree_cleanup" });
+      markInserted();
+      await released;
+    });
+    await Promise.race([inserted, holder]);
+    let settled: Awaited<ReturnType<typeof settleInterruptedNativeBootstrap>> | "blocked";
+    try {
+      settled = await Promise.race([settleInterruptedNativeBootstrap(db, { run, providerDispatchStarted: false }),
+        new Promise<"blocked">(resolve => setTimeout(() => resolve("blocked"), 3_000))]);
+    } finally { release(); await holder; }
+    expect(settled).toMatchObject({ id: run.id, resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } });
   });
   it.each(["already-blocked", "human-reblock", "dependency-change", "new-session", "new-owner", "other-execution"])("does not undo %s when settling bootstrap evidence", async kind => {
     const { f, run } = await interruptedBootstrap();
