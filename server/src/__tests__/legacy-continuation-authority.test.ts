@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
+import { legacyExecutionNeedsReconciliationWithEvidence, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
 
 describe("legacy continuation persisted authority", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -33,6 +36,49 @@ describe("legacy continuation persisted authority", () => {
     }
     return { companyId, agentId, issueId, runId, createRecovery, runs, actions, finish };
   }
+  it("does not freeze a never-started dispatch cancellation or retain its historical hold", async () => {
+    const f = await fixture();
+    await db.update(heartbeatRuns).set({ status: "queued", resultJson: null }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(issues).set({ assigneeAgentId: null }).where(eq(issues.id, f.issueId));
+    expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ companyId: f.companyId,
+      runId: f.runId, expectedStatus: "queued", now: new Date() })).toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+    const run = (await f.runs())[0];
+    expect(await legacyExecutionNeedsReconciliationWithEvidence(db, run)).toBe(false);
+    await terminalizeLegacyExecution({ db, run, status: "cancelled", fromStatuses: ["cancelled"], reconcileIfNeeded: true });
+    expect(await f.actions()).toHaveLength(0);
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", ownerType: "board",
+      fingerprint: `legacy-execution:${run.id}`, status: "resolved", outcome: "blocked", nextAction: "Reconcile",
+      evidence: { runId: run.id, automaticRecovery: { replay: "blocked" } } });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    for (const errorCode of ["issue_not_found", "issue_not_in_progress", "issue_waiting_for_response",
+      "issue_dependencies_blocked", "issue_blocked",
+      "issue_execution_lock_changed", "issue_terminal_status", "issue_review_participant_changed"]) {
+      const changed = { ...run, errorCode };
+      await db.update(heartbeatRuns).set(changed).where(eq(heartbeatRuns.id, run.id));
+      expect(await legacyExecutionNeedsReconciliationWithEvidence(db, changed)).toBe(false);
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    }
+    const reviewWait = { ...run, errorCode: "issue_continuation_waiting_on_review", resultJson: {
+      stopReason: "issue_continuation_waiting_on_review", timeoutSource: "stale_queued_run_gate",
+    } };
+    await db.update(issues).set({ assigneeAgentId: f.agentId }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set(reviewWait).where(eq(heartbeatRuns.id, run.id));
+    expect(await legacyExecutionNeedsReconciliationWithEvidence(db, reviewWait)).toBe(false);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ canRetry: true });
+    for (const patch of [{ startedAt: new Date() }, { processPid: 123456789 }, { processGroupId: 123456789 },
+      { processStartedAt: new Date() }, { sessionIdAfter: "provider-session" }, { errorCode: "cancelled" }]) {
+      const changed = { ...run, ...patch };
+      await db.update(heartbeatRuns).set(changed).where(eq(heartbeatRuns.id, run.id));
+      expect(await legacyExecutionNeedsReconciliationWithEvidence(db, changed)).toBe(true);
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
+    }
+    await db.update(heartbeatRuns).set(run).where(eq(heartbeatRuns.id, run.id));
+    await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: run.id, agentId: f.agentId,
+      seq: 2, eventType: "adapter.invoke" });
+    expect(await legacyExecutionNeedsReconciliationWithEvidence(db, run)).toBe(true);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
+  });
   it.each([1, 2, 3, 4, 5])("deduplicates concurrent replay with stale prose-derived liveness (%s)", async () => {
     const f = await fixture();
     const recovery = f.createRecovery();

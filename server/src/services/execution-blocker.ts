@@ -1,4 +1,5 @@
-import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
+import { isPreDispatchReviewWait, neverStartedDispatchCancellationPredicate } from "./pre-dispatch-review-wait.js";
+import { canonicalExecutionUuid } from "./execution-identity.js";
 import { and, desc, eq, gt, inArray, not, or, sql } from "drizzle-orm";
 import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { z } from "zod";
@@ -13,6 +14,17 @@ import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA, nativeR
 export function executionBlockerPredicate() {
   return and(
     not(conversationRecoveryActionPredicate()!),
+    sql`not (${issueRecoveryActions.cause} = 'legacy_execution_requires_reconciliation' and exists (
+      select 1 from ${heartbeatRuns}
+      where ${heartbeatRuns.companyId} = ${issueRecoveryActions.companyId}
+        and ${heartbeatRuns.id} = ${canonicalExecutionUuid(sql`${issueRecoveryActions.evidence}->>'runId'`)}
+        and (${heartbeatRuns.issueId} = ${issueRecoveryActions.sourceIssueId}
+          or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRecoveryActions.sourceIssueId}::text)
+        and ${neverStartedDispatchCancellationPredicate()}
+        and ${heartbeatRuns.errorCode} <> 'issue_continuation_waiting_on_review'
+        and coalesce(${issueRecoveryActions.evidence}->>'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'
+        and coalesce(${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema', '') <> 'paperclip.workspace-restore-recovery.v1'
+    ))`,
     inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
     or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
       sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`),
