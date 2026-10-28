@@ -1034,6 +1034,43 @@ describeEmbeddedPostgres("attention service", () => {
     expect(feed.items.filter((item) => item.sourceKind === "failed_run")).toEqual([]);
   });
 
+  it("suppresses failed-run attention once the related issue is done or cancelled", async () => {
+    const { companyId, workerId } = await seedCompany("ATC");
+    const openIssueId = await insertIssue({ companyId, identifier: "ATC-1", title: "Open task", status: "in_progress" });
+    const doneIssueId = await insertIssue({ companyId, identifier: "ATC-2", title: "Done task", status: "done" });
+    const cancelledIssueId = await insertIssue({ companyId, identifier: "ATC-3", title: "Cancelled task", status: "cancelled" });
+    const failedAt = new Date("2026-07-09T12:00:00.000Z");
+    const runIds = [randomUUID(), randomUUID(), randomUUID()];
+    const [openRunId] = runIds;
+
+    await db.insert(heartbeatRuns).values([openIssueId, doneIssueId, cancelledIssueId].map((issueId, index) => ({
+      id: runIds[index],
+      companyId,
+      agentId: workerId,
+      invocationSource: "automation" as const,
+      status: "failed",
+      error: "adapter failed",
+      contextSnapshot: { issueId },
+      createdAt: failedAt,
+      updatedAt: failedAt,
+      finishedAt: failedAt,
+    })));
+    await db.insert(heartbeatRunEvents).values(runIds.map((runId) => ({
+      companyId,
+      runId,
+      agentId: workerId,
+      seq: 1,
+      eventType: "lifecycle",
+      message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+      createdAt: new Date("2026-07-09T12:00:01.000Z"),
+    })));
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+
+    expect(feed.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id))
+      .toEqual([openRunId]);
+  });
+
   it("enriches interaction details with project, workspace, plan metadata, and images", async () => {
     const { companyId, workerId } = await seedCompany("ATE");
     const projectId = randomUUID();

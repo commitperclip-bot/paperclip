@@ -1765,6 +1765,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
 
         const issue = issueId ? failedIssueMap.get(issueId) ?? null : null;
         if (issueId && !issue) continue;
+        if (issue && (issue.status === "done" || issue.status === "cancelled")) continue;
         const dedupKey = `run:${run.id}`;
         add(createItem({
           companyId,
@@ -1794,7 +1795,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           ),
           inlineResolvable: true,
           entryRule: "latest failed/timed_out run has a Bounded retry exhausted lifecycle event.",
-          exitRule: "A newer run exists for the same issue/agent pair or the row is dismissed.",
+          exitRule: "A newer run exists for the same issue/agent pair, the related issue is done or cancelled, or the row is dismissed.",
           dedupKey,
           severity: "high",
           activityAt: toIso(run.finishedAt ?? run.updatedAt ?? run.createdAt),
