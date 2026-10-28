@@ -4939,7 +4939,11 @@ export async function runChildProcess(
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
-          void target.cleanup?.();
+          void Promise.resolve()
+            .then(() => target.cleanup?.())
+            .catch((cleanupErr) =>
+              onLogError(cleanupErr, runId, "sandbox cleanup failed"),
+            );
           const errno = (err as NodeJS.ErrnoException).code;
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
           const msg =
@@ -4962,6 +4966,9 @@ export async function runChildProcess(
             void logChain.finally(() => {
               void Promise.resolve()
                 .then(() => target.cleanup?.())
+                .catch((cleanupErr) =>
+                  onLogError(cleanupErr, runId, "sandbox cleanup failed"),
+                )
                 .finally(() => {
                   resolve({
                     exitCode: code,
