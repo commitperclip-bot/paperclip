@@ -2446,6 +2446,58 @@ describe("shared ACPX engine runtime behavior", () => {
     ).toBe("second");
   });
 
+  it.each(["create_runtime", "ensure_session", "configure_session", "turn"])(
+    "preserves sanitized JSON-RPC diagnostics when %s fails",
+    async (phase) => {
+      for (const shape of ["string", "details", "message"]) {
+        const root = await makeTempRoot();
+        const detail = "Invalid session configuration: model_context_window must be a number; private-setting-value";
+        const data = shape === "string" ? detail : { [shape]: detail };
+        const err = Object.assign(new Error("Internal error"), { code: -32603, data });
+        const fail = () => { throw err; };
+        const logs: string[] = [];
+        const execute = createAcpxEngineExecutor({
+          createRuntime: () => {
+            if (phase === "create_runtime") fail();
+            return {
+              ...buildRuntime(),
+              ...(phase === "ensure_session" ? { ensureSession: fail } : {}),
+              ...(phase === "configure_session" ? { setConfigOption: fail } : {}),
+              ...(phase === "turn" ? { startTurn: () => ({
+                events: (async function* () { fail(); })(),
+                result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+                cancel: async () => {},
+              }) } : {}),
+            } as never;
+          },
+        });
+        const result = await execute({
+          runId: "run-1",
+          agent: { id: "agent-1", companyId: "company-1" },
+          runtime: {},
+          config: {
+            agent: "custom",
+            agentCommand: "node ./fake-acp.js",
+            stateDir: path.join(root, "state"),
+            thinkingEffort: "high",
+            env: { PRIVATE_SETTING: "private-setting-value" },
+          },
+          context: {},
+          onLog: async (_stream: string, text: string) => { logs.push(text); },
+          onMeta: async () => {},
+        } as never);
+        expect(result.exitCode).toBe(1);
+        expect(result.errorMessage).toContain("Internal error\nInvalid session configuration: model_context_window must be a number;");
+        expect(result.errorMessage).not.toContain("private-setting-value");
+        expect(result.summary).toBe(result.errorMessage);
+        expect(result.errorMeta).toMatchObject({ phase, rpcCode: -32603 });
+        const payload = JSON.parse(logs.find((text) => text.includes('"type":"acpx.error"'))!.trim());
+        expect(payload.message).toBe(result.errorMessage);
+        expect(payload.rpcCode).toBe(-32603);
+      }
+    },
+  );
+
   it("enriches acpx.error diagnostics and child stderr when ensureSession rejects", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
