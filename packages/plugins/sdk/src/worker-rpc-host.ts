@@ -720,6 +720,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       },
 
       projects: {
+        async resolveGitCredential(projectId, workspaceId, companyId) {
+          return callHost("projects.resolveGitCredential", { projectId, workspaceId, companyId });
+        },
         async list(input) {
           return callHost("projects.list", {
             companyId: input.companyId,
@@ -1166,8 +1169,8 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         async getRuntimeIdentity(agentId, companyId) {
           return callHost("agents.getRuntimeIdentity", { agentId, companyId });
         },
-        async getRuntime(agentId, companyId) {
-          return callHost("agents.getRuntime", { agentId, companyId });
+        async getRuntime(agentId, companyId, environmentId, installEnvironmentSkills) {
+          return callHost("agents.getRuntime", { agentId, companyId, ...(environmentId ? { environmentId } : {}), ...(installEnvironmentSkills ? { installEnvironmentSkills: true } : {}) });
         },
         async list(input) {
           return callHost("agents.list", {

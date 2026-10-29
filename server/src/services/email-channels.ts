@@ -1,3 +1,4 @@
+import type { ConnectionManagementContext } from "./connection-management.js";
 import { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { fastResponseService, enqueueFastResponse, fastResponseSourceCurrent, fastResponseTurnQueued } from "./fast-responses.js";
@@ -72,6 +73,7 @@ import {
 } from "./agentmail-api.js";
 
 export type EmailActor = {
+  managementContext?: ConnectionManagementContext;
   userId?: string;
   agentId?: string;
   runId?: string;
@@ -277,6 +279,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
       companyId: endpoint.companyId,
       actorType: actor.agentId ? "agent" : actor.userId ? "user" : "system",
       actorId: actor.agentId ?? actor.userId ?? "agentmail",
+      ...actor.managementContext?.audit,
       action,
       entityType: "tool_connection",
       entityId: endpoint.connectionId,
@@ -627,6 +630,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
     input: EmailEndpointSetupInput,
     actor: EmailActor,
   ) {
+    await actor.managementContext?.reauthorize();
     const [agent] = await db
       .select()
       .from(agents)
@@ -684,6 +688,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
     )
       throw conflict("Setup request already belongs to another inbox");
     if (!endpoint) {
+      await actor.managementContext?.reauthorize();
       const applicationId = input.applicationId ?? randomUUID();
       const connectionId = randomUUID();
       await db.transaction(async (tx) => {
@@ -725,6 +730,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
           authKind: "api_key",
           ownership: "customer",
           credentialPolicy: "shared",
+          createdByUserId: actor.userId ?? null,
           status: "draft",
           enabled: false,
           config: { provider: "agentmail" },
@@ -831,6 +837,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
           });
       if (scope.scope_type === "inbox" && scope.inbox_id !== inbox.inbox_id)
         throw forbidden("API key belongs to a different inbox");
+      await actor.managementContext?.reauthorize();
       await db
         .update(chatEndpoints)
         .set({
@@ -851,6 +858,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
       if (!config.ownedApiKeyId && scope.scope_type !== "inbox") {
         const key = await api.createInboxKey(inbox.inbox_id);
         try {
+          await actor.managementContext?.reauthorize();
           await vault(endpoint, "apiKey", key.api_key);
           await db
             .update(emailEndpoints)
@@ -881,6 +889,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
           );
         const webhook = await createWebhook({ ...endpoint, botExternalId: inbox.inbox_id }, api);
         try {
+          await actor.managementContext?.reauthorize();
           await vault(endpoint, "webhookSecret", webhook.secret);
           await db
             .update(emailEndpoints)
@@ -891,6 +900,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
           throw error;
         }
       }
+      await actor.managementContext?.reauthorize();
       const now = new Date();
       await db.transaction(async (tx) => {
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.email);
@@ -2375,6 +2385,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
     action: "pause" | "resume" | "remove",
     actor: EmailActor,
   ) {
+    await actor.managementContext?.reauthorize();
     const endpoint = await getEndpoint(id);
     const result = await withLease(endpoint, async () => {
       const config = await getConfig(id);
@@ -2387,6 +2398,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
           endpoint.botExternalId!,
         );
       }
+      await actor.managementContext?.reauthorize();
       if (action !== "resume") await stopEndpoint(endpoint);
       let cleanupError: string | null = null;
       if (action === "remove") {
@@ -2477,6 +2489,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
     receiveMode: "websocket" | "webhook",
     actor: EmailActor,
   ) {
+    await actor.managementContext?.reauthorize();
     const endpoint = await getEndpoint(id);
     if (endpoint.status === "archived" || !endpoint.botExternalId)
       throw conflict("Create a new inbox connection");
@@ -2488,6 +2501,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
     )
       throw forbidden("API key belongs to a different inbox");
     await api.getInbox(endpoint.botExternalId);
+    await actor.managementContext?.reauthorize();
     const result = await withLease(endpoint, async () => {
       const config = await getConfig(id);
       // Check registration permissions before interrupting a working socket.
@@ -2496,6 +2510,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
         : null;
       if (preparedWebhook) {
         try {
+          await actor.managementContext?.reauthorize();
           await vault(endpoint, "webhookSecret", preparedWebhook.secret);
           await db.update(emailEndpoints).set({ webhookId: preparedWebhook.webhook_id })
             .where(eq(emailEndpoints.endpointId, id));
@@ -2504,6 +2519,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
           throw error;
         }
       }
+      await actor.managementContext?.reauthorize();
       await stopEndpoint(endpoint);
       // Only registrations and scoped keys created by Paperclip are removed.
       if (config.webhookId)

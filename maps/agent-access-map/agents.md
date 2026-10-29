@@ -50,11 +50,22 @@ permission. Its creator can finish their own inactive setup with that permission
 changing another person's setup requires configuration permission.
 Creation retries reuse only records owned by the caller. Returning a completed
 record also requires the normal agent-read and configuration-read checks.
-An unfinished record stays paused with a
+An unfinished record keeps compatibility status `paused` with a
 `setup` hold and cannot receive API keys or authenticate with keys or JWTs.
 Its standard grants apply at hire. Authorized completion retries recover the
 same record and approval without changing the submitted configuration.
 Normal agent-authored hiring keeps its existing approval policy.
+
+An agent-owned plugin may prepare the draft and leave its lifecycle in
+`verifying` while that setup hold remains. Only bounded Core-issued setup probes
+can run there. The creator's company creation permission also covers configuring
+and retrying their draft during preparation or stopping; other actors still require the
+ordinary configuration permission. This is a board wizard path, not new agent
+execution or probe authority. Lifecycle and component regressions cover these
+transitions; no permitted-agent or live-provider journey is claimed here.
+Companies requiring hire approval keep drafts paused and allocate no agent-owned
+resource before approval. Selecting an account there is pending verification,
+not approval or execution authority.
 
 The creation boundary resolves the request-level runner before adapter validation
 and credential normalization. Omitted/automatic new Codex selection uses the
@@ -112,7 +123,7 @@ API: `present` — representative operation IDs:
   receives `canManage: false`. Saving never creates a run or wakeup.
 - `PUT /api/agents/{id}/instructions-bundle/file`.
 - `PATCH /api/agents/{id}` with an explicit `runner: "paperclip"` upgrade.
-- `POST /api/agents/{id}/qualify-runner` to qualify the saved effective sandbox before upgrading.
+- `POST /api/agents/{id}/qualify-runner` to qualify the saved effective sandbox before upgrading or testing an existing native runner.
 - `PATCH /api/agents/{id}` with `runtimeSettings: { harness, model?, aiConnection?, expected: { model, aiConnection } }` for a narrow roster edit. Each request handles one agent; the UI batches at most four writes and collects per-agent outcomes.
 
 Agent access: `available` — Native read/update/history/restore instruction tools; REST /
@@ -128,9 +139,11 @@ environment, and consent checks as other edits. It adds no agent permission or
 credential fallback. Pool and externally managed agents use their existing
 configuration surfaces. Board browser verification does not qualify agent access.
 
-The existing-agent upgrade notice uses this configuration PATCH. It does not
+The existing-agent upgrade notice for Claude, Codex, and Grok Build uses this configuration PATCH. It does not
 grant configuration, account, or environment access. The server resolves the
-saved settings under normal company/configuration authorization. Obsolete Claude
+saved settings under normal company/configuration authorization. Grok migration preserves
+the effective legacy search setting. Task model/effort overrides retain the
+agent's account binding and tool policy without granting extra account access. Obsolete Claude
 tuning fields are removed with `configurationWarnings`; security incompatibilities
 remain errors. Unqualified sandbox upgrades first use the agent-scoped
 `POST /api/agents/{id}/qualify-runner` under the same `agent_config:update`
@@ -138,7 +151,11 @@ authorization as saving the upgrade. The server resolves the saved computer;
 `expectedEnvironmentId` rejects stale state and cannot select another computer.
 Qualification checks company binding, returns only its receipt, and audits within
 the agent's company. General instance environment probes still require instance
-admin. No probe runs merely on page load. Operator browser evidence does not
+admin. An existing native agent's clean configuration Test uses the same
+saved-computer qualification before its runtime test. A current proof is reused;
+a missing or stale proof requires a real successful probe and verified cleanup.
+Draft settings and target changes do not qualify another computer. No probe runs
+merely on page load. Operator browser evidence does not
 qualify the agent permission paths for this operation.
 
 Evidence: `source-only` — [implementation](../../server/src/routes/agents.ts#L1395) at

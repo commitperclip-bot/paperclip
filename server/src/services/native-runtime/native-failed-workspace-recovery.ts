@@ -9,8 +9,11 @@ import type { NativeRestartRecoveryClaim } from "./native-restart-recovery.js";
 import { NativeWorkspaceFinalizationBusyError } from "./native-workspace-finalization-ownership.js";
 import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
 import { logger } from "../../middleware/logger.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 
-export async function preserveNativeFailedWorkspace(db: Db, selected: typeof heartbeatRuns.$inferSelect, options: { allowPreterminal?: boolean; restartRecovery?: NativeRestartRecoveryClaim } = {}) {
+export async function preserveNativeFailedWorkspace(db: Db, selected: Pick<typeof heartbeatRuns.$inferSelect,
+  "id" | "companyId" | "nativeIssueId" | "issueId" | "contextSnapshot" | "runnerProfileJson">,
+  options: { allowPreterminal?: boolean; restartRecovery?: NativeRestartRecoveryClaim } = {}) {
   if (readNativeWorkspaceSyncReference(selected.runnerProfileJson?.nativeWorkspaceSync)?.state !== "prepared") return;
   const issueId = selected.nativeIssueId ?? selected.issueId ?? selected.contextSnapshot?.issueId;
   if (typeof issueId !== "string") return;
@@ -53,6 +56,7 @@ export async function preserveNativeFailedWorkspace(db: Db, selected: typeof hea
     // Their Runner descriptor is not evidence that user files need exporting.
     const retainFiles = !nativeRunHasNoWorkspaceAccess(run);
     const alreadyRetained = hasRequiredWorkspaceRecovery(run.resultJson);
+    if (retainFiles && !alreadyRetained) await notifyDeliveryWork(tx, DELIVERY_QUEUES.workspaceRecovery);
     let retained = !retainFiles || alreadyRetained ? run : await recordRequiredWorkspaceRestoreFailure(tx as unknown as Db, run, { workspaceRestoreFailure: "restore_failed" }, source);
     if (!retained || retainFiles && !hasRequiredWorkspaceRecovery(retained.resultJson)) return;
     if (options.allowPreterminal && coordinator.phase === "observed") {
@@ -79,6 +83,36 @@ export async function preserveNativeFailedWorkspace(db: Db, selected: typeof hea
     });
     return retained;
   });
+}
+
+export async function preserveOrphanedNativeWorkspace(db: Db, lease: Pick<typeof environmentLeases.$inferSelect,
+  "companyId" | "heartbeatRunId">): Promise<boolean> {
+  if (!lease.heartbeatRunId) return false;
+  const [run] = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, lease.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId),
+    eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "failed"),
+  )).limit(1);
+  if (!run || hasRequiredWorkspaceRecovery(run.resultJson)) return false;
+  try {
+    const retained = await preserveNativeFailedWorkspace(db, run);
+    return Boolean(retained && hasRequiredWorkspaceRecovery(retained.resultJson));
+  } catch (error) {
+    if (error instanceof NativeWorkspaceFinalizationBusyError) return false;
+    const code = retentionContentionCode(error);
+    if (!code) throw error;
+    logger.warn({ runId: run.id, code }, "Native workspace retention is waiting for its current owner");
+    return false;
+  }
+}
+
+function retentionContentionCode(error: unknown): string | null {
+  let current = error;
+  for (let depth = 0; depth < 4 && current && typeof current === "object"; depth++) {
+    const value = current as { code?: unknown; cause?: unknown };
+    if (value.code === "55P03" || value.code === "57014") return value.code;
+    current = value.cause;
+  }
+  return null;
 }
 
 const cancelledWorkspaceCursors = new WeakMap<Db, string>();
@@ -113,13 +147,7 @@ export async function preserveCancelledNativeWorkspaces(db: Db) {
       try { await preserveNativeFailedWorkspace(db, run, { allowPreterminal: true }); }
       catch (error) {
         if (error instanceof NativeWorkspaceFinalizationBusyError) continue;
-        let current: unknown = error;
-        let code: string | null = null;
-        for (let depth = 0; depth < 4 && current && typeof current === "object"; depth++) {
-          const value = current as { code?: unknown; cause?: unknown };
-          if (value.code === "55P03" || value.code === "57014") { code = value.code; break; }
-          current = value.cause;
-        }
+        const code = retentionContentionCode(error);
         if (!code) throw error;
         logger.warn({ runId: run.id, code }, "Cancelled native workspace retention is waiting for its current owner");
       }

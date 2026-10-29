@@ -1,4 +1,5 @@
 import profiles from "../acpx-profiles.json" with { type: "json" };
+import compatibility from "../src/live/provider-pack-contract.json" with { type: "json" };
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
@@ -312,6 +313,7 @@ try {
         cwd: workspaceRoot,
       }).status !== 0;
   const payload = {
+    compatibility,
     pins: {
       nodeMinimum: minimumNodeVersion.join("."),
       codex: profiles.profiles.codex.agentRuntimeVersion,

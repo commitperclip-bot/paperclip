@@ -2,7 +2,8 @@ import { join } from "node:path";
 import { probePluginRunnerEnvironment } from "./native-runtime/plugin-runner-probe.js";
 import { registerPluginTaskCredentialHandoff } from "./plugin-task-credential-writeback.js";
 import { randomUUID } from "node:crypto";
-import type { Db } from "@paperclipai/db";
+import { agents, companies, type Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type { AdapterEnvironmentCheck } from "@paperclipai/adapter-utils";
 import { parseObject } from "@paperclipai/adapter-utils/server-utils";
@@ -19,6 +20,7 @@ import { validateAiApiKey } from "./ai-api-key-test.js";
 import { probeCopilotExecutionTarget } from "./copilot-connection-probe.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
+import { pluginEnvironmentRequiresAgent } from "./plugin-environment-driver.js";
 const asRecord = (value: unknown): Record<string, unknown> | null => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: PluginWorkerManager) {
   const instanceSettings = instanceSettingsService(db);
@@ -212,6 +214,25 @@ export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: Plugin
     // agent lease) and archive it on release instead of deleting it, so the
     // operator can inspect the exact sandbox from the provider dashboard while
     // provider-side expiry reaps it later.
+    if (environment.driver === "plugin" && await pluginEnvironmentRequiresAgent(db, environment)) {
+      const [agent] = input.agentId ? await db.select({ state: agents.lifecycleState, pauseReason: agents.pauseReason,
+        requiresApproval: companies.requireBoardApprovalForNewAgents }).from(agents)
+        .innerJoin(companies, eq(companies.id, agents.companyId))
+        .where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId))) : [];
+      if (agent?.state === "paused" && agent.pauseReason === "setup" && agent.requiresApproval) return {
+        executionTarget: null, environmentName: environment.name, fallbackChecks: [{
+          code: "environment_agent_approval_required", level: "warn",
+          message: "The selected account will be verified on the agent computer after hire approval.",
+        }], release: noopRelease,
+      };
+      if (!agent || ["paused", "preparing"].includes(agent.state)) return {
+        executionTarget: null, environmentName: environment.name, fallbackChecks: [{
+          code: !input.agentId ? "environment_agent_required" : "environment_agent_preparing", level: "warn",
+          message: !input.agentId ? "This environment needs a saved agent before its connection can be tested."
+            : "The agent computer is being prepared. Test the connection when preparation finishes.",
+        }], release: noopRelease,
+      };
+    }
     const testEnvironment = environment.driver === "sandbox"
       ? {
           ...environment,

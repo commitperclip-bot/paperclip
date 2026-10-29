@@ -126,21 +126,38 @@ describe.skipIf(!support.supported)("released native monitor results", () => {
     },
   );
 
-  it("supersedes an earlier authority error without replaying the accepted result", async () => {
+  it.each(["schedule", "receipt", "finished_time"] as const)("supersedes an earlier authority error after restoring %s without replaying the result", async state => {
     const f = await fixture(), scheduled = await f.readIssue();
-    await db.update(issues).set({ executionPolicy: {}, monitorNextCheckAt: null }).where(eq(issues.id, f.issueId));
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(nativeRunFinalizations).set({ controllerBootId: randomUUID(), attempt: 1 })
+      .where(eq(nativeRunFinalizations.runId, f.runId));
+    if (state === "schedule") await db.update(issues).set({ executionPolicy: {}, monitorNextCheckAt: null }).where(eq(issues.id, f.issueId));
+    if (state === "receipt") await db.update(heartbeatRuns).set({ resultJson: {} }).where(eq(heartbeatRuns.id, f.runId));
+    if (state === "finished_time") await db.update(heartbeatRuns).set({ finishedAt: null }).where(eq(heartbeatRuns.id, f.runId));
     await f.finalize();
     const old = await db.select().from(statusDecisions).where(eq(statusDecisions.runId, f.runId));
     expect(old.some(decision => decision.reasonCode === "monitor_wait_authority_lost")).toBe(true);
-    await db.update(issues).set({ executionPolicy: scheduled.executionPolicy, monitorNextCheckAt: scheduled.monitorNextCheckAt })
+    if (state === "schedule") await db.update(issues).set({ executionPolicy: scheduled.executionPolicy, monitorNextCheckAt: scheduled.monitorNextCheckAt })
       .where(eq(issues.id, f.issueId));
+    if (state === "receipt") {
+      const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      await db.update(heartbeatRuns).set({ resultJson: { ...current.resultJson,
+        semanticToolReceipts: source.resultJson?.semanticToolReceipts } }).where(eq(heartbeatRuns.id, f.runId));
+    }
+    if (state === "finished_time") await db.update(heartbeatRuns).set({ finishedAt: f.finishedAt }).where(eq(heartbeatRuns.id, f.runId));
     await f.finalize();
-    expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))[0].phase).toBe("committed");
+    const [settled] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId));
+    expect(settled).toMatchObject({ phase: "committed", nextAttemptAt: null, attempt: 1 });
     const after = await db.select().from(statusDecisions).where(eq(statusDecisions.runId, f.runId));
     for (const before of old) expect(after.find(decision => decision.id === before.id)).toEqual(before);
     expect(after.some(decision => decision.reasonCode === "scheduled_monitor_preserved")).toBe(true);
     expect((await db.select().from(nativeRunResults).where(eq(nativeRunResults.id, f.resultId)))[0].resultJson).toEqual(f.result);
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toEqual([]);
+    expect(await f.readIssue()).toMatchObject({ monitorNextCheckAt: scheduled.monitorNextCheckAt,
+      executionRunId: null, checkoutRunId: null });
+    await f.finalize();
+    expect(await db.select().from(statusDecisions).where(eq(statusDecisions.runId, f.runId))).toEqual(after);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].finishedAt).toEqual(f.finishedAt);
   });
 
   it("notifies the existing monitor scheduler once when finalization stops blocking it", async () => {

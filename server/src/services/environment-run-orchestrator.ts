@@ -273,6 +273,7 @@ export function environmentRunOrchestrator(
     adapterType: string;
     adapterConfig?: Record<string, unknown>;
     admittedLifecycleMode?: "warm" | "per_turn";
+    managedAiCredentialIdentity?: string;
     issueId: string | null;
     heartbeatRunId: string;
     agentId: string;
@@ -292,7 +293,7 @@ export function environmentRunOrchestrator(
     });
 
     const environment = resolveRunnerEnvironmentForRun(
-      selectedEnvironment, input.adapterType, input.adapterConfig, input.admittedLifecycleMode,
+      selectedEnvironment, input.adapterType, input.adapterConfig, input.admittedLifecycleMode, input.managedAiCredentialIdentity,
     );
 
     if (input.recoverPluginTask && environment.driver === "plugin" && input.adapterType === "paperclip_runner") {

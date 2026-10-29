@@ -73,6 +73,41 @@ const support = externalTestDatabaseUrl ? { supported: true } : await getEmbedde
     expect(JSON.stringify(events)).not.toContain(bulk.slice(0, 64));
   });
 
+  it.each(["legacy", "native"])("returns one complete run when retained workspace evidence is unchanged for %s", async (runtimeMode) => {
+    const f = await seed();
+    const bulk = randomBytes(128 * 1024).toString("base64");
+    const [saved] = await db.update(heartbeatRuns).set({ runtimeMode, status: "failed", finishedAt: new Date(),
+      contextSnapshot: { ...f.run.contextSnapshot, savedInput: bulk }, runnerProfileJson: { savedProfile: bulk },
+      stdoutExcerpt: bulk, stderrExcerpt: bulk,
+    }).where(eq(heartbeatRuns.id, f.runId)).returning();
+    const recordRestoreFailureOnly = runtimeMode === "native";
+    const failed = (await terminalizeLegacyExecution({ db, run: saved!, status: "failed", recordRestoreFailureOnly,
+      workspaceRestoreSource: f.lease,
+      patch: { resultJson: { workspaceRestoreFailure: "restore_failed", futureResult: bulk } },
+    }))!;
+    const events: Array<Record<string, unknown>> = [], now = Date.now();
+    const capture = createDatabaseResponseCapture({ start: now - 100, end: now + 59_000 }, event => events.push(event));
+    installDatabaseResponseCapture(db, { heartbeatRuns }, capture);
+    let returned: Awaited<ReturnType<typeof terminalizeLegacyExecution>>;
+    try { returned = await terminalizeLegacyExecution({ db, run: failed, status: "failed", recordRestoreFailureOnly,
+      workspaceRestoreSource: f.lease,
+      ...(recordRestoreFailureOnly ? { patch: { resultJson: failed.resultJson } } : {}),
+    }); }
+    finally { capture.flush(); }
+    const writes = events.filter(event => event.event === "paperclip.db_response_capture.entry.v1"
+      && event.table === "heartbeat_runs" && event.operation === "update");
+    expect(writes.reduce((sum, group) => sum + Number(group.rows), 0)).toBe(1);
+    expect(returned).toMatchObject({ id: f.runId, status: "failed", finishedAt: failed.finishedAt,
+      contextSnapshot: failed.contextSnapshot, runnerProfileJson: failed.runnerProfileJson, resultJson: failed.resultJson,
+      stdoutExcerpt: bulk, stderrExcerpt: bulk });
+    if (!recordRestoreFailureOnly) expect(returned!.executionStatusDeliveryId).toBe(failed.executionStatusDeliveryId);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]).toEqual(returned);
+    expect(await readLease(f.lease.id)).toMatchObject({ status: "pending_cleanup", leasePolicy: "retain_on_failure" });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId)))
+      .toEqual([expect.objectContaining({ evidence: expect.objectContaining({ runId: f.runId }), ownerType: "board" })]);
+    expect(JSON.stringify(events)).not.toContain(bulk.slice(0, 64));
+  });
+
   it("preserves pending and acknowledged status delivery on unpatched legacy recovery retries", async () => {
     await deliverExecutionStatuses(db, { publish: vi.fn() });
     const f = await seed();

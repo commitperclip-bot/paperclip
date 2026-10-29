@@ -614,10 +614,10 @@ describe("agent live run routes", () => {
     });
   });
 
-  it("uses narrow run log metadata lookups for log polling", async () => {
+  it.each([false, true])("uses narrow run log metadata lookups (aligned tail: %s)", async (aligned) => {
     const res = await requestApp(await createApp(), (baseUrl) =>
       request(baseUrl).get(
-        "/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/log?offset=12&limitBytes=64",
+        `/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/log?offset=12&limitBytes=64${aligned ? "&alignStartToRecord=true" : ""}`,
       ),
     );
 
@@ -635,6 +635,8 @@ describe("agent live run routes", () => {
       {
         offset: 12,
         limitBytes: 64,
+        signal: expect.any(AbortSignal),
+        ...(aligned ? { alignStartToRecord: true } : {}),
       },
     );
     expect(res.body).toEqual({

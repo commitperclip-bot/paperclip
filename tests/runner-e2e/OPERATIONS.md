@@ -223,7 +223,8 @@ stable key-sorted JSON hashing. The model configuration contains `provider`,
 `mode` (the manifest route), `price`, `maximumInputTokens`,
 `maximumOutputTokens`, and `reservation` (the nine-decimal value from
 `evalRequestReservation`). An operating configuration contains allowance
-`reference`, `runner`, `verifiedAt`, `expiresAt`, and a `component` object with
+`reference`, `runner`, `verifiedAt`, `expiresAt`, optional `accountingReadiness`
+(only when present), and a `component` object with
 its `component`, `maxUsd`, and `reference`. Changing any of those values
 invalidates the approval hash. Evidence metadata itself is excluded from this
 configuration hash.
@@ -439,8 +440,11 @@ attempt. Installing the ACP package alone does not satisfy this setup path.
 
 Bounded cases keep the gateway in the setup phase until the created agent's
 asynchronous lifecycle verification reaches ready. This wait uses the remaining
-attempt deadline, allows at most 45 seconds, and stops on an observed setup error
+attempt deadline, allows at most 45 seconds locally and the bounded attempt window
+for Daytona provisioning, and stops on an observed setup error
 or hold. The private `budgeted-setup.json` snapshot retains state transitions.
+Budgeted Daytona fixtures give the saved-account hello probe five minutes inside
+that attempt window; its former 90-second default could expire during cold startup.
 Only then does the case begin agent-phase accounting and create its task.
 Older evidence that advanced after fixture creation may label hello probes as
 agent cost. Its campaign totals still include those requests; retain that phase
@@ -897,3 +901,69 @@ an operations manifest. They use the same metered connection, prices, campaign
 journal, setup boundary, and durable attempt allowance as core compatibility.
 Collection and the independent saved-evidence oracle require no additional
 model call. The synthetic items need review as test data, not product incidents.
+
+
+### Qualify model spend while operating reconciliation is pending
+
+Set `accountingReadiness: "model_requests"` on the reviewed allowance to use
+complete model receipts as the scheduled readiness gate. This is an explicit
+operator policy. The report retains the full-accounting status, operating
+reservations and model-readiness status separately. It does not release any
+historical hold or certify a full-lifecycle vendor cost bound. Missing model
+receipts, conflicts, active requests, excess commitments, and the existing
+product, cleanup, feedback and trace checks still fail qualification.
+
+
+### Explicit bounded Daytona gateway qualification
+
+A manual manifest can set `remoteGateway: "cloudflare"` for the native Codex
+or Claude marker/feedback Daytona cells. Install `cloudflared` on the controller
+PATH, or set `PAPERCLIP_EVAL_CLOUDFLARED` to its executable path. Empty overrides
+use the PATH default. The parent starts its existing model
+gateway and native OTLP relay, then exposes only their authenticated endpoints
+through one owned HTTPS quick tunnel. It verifies a fresh health nonce before
+fixture setup, waits up to 120 seconds for registration and 120 seconds for
+public readiness, and does not retry tunnel creation or provider work.
+
+Only attempt-scoped tokens leave the controller. Provider and Braintrust keys
+stay in the parent; the fixture/server retains the existing Daytona provisioning
+credential separately. The model gateway still enforces its campaign allowance,
+request count, concurrency, deadline and receipt journal. The bridge streams
+responses and preserves terminal-usage draining after a client disconnect.
+The tunnel receives no ambient provider credentials or Cloudflare config. Its
+exposure closes at the campaign deadline or four hours after startup, whichever
+comes first, and on attempt cleanup. Owned gateway,
+relay and tunnel cleanup failures remain failures. A configured remote route
+is not live acceptance; retain the actual Daytona result, cleanup, feedback,
+native traces and complete model receipts.
+
+The Daytona image runs Linux/x64. ARM or macOS controllers use the image's
+verified daemon by default; only an explicit cross-compiled remote override
+replaces it.
+
+Daily and weekly selections remain local. This explicit remote option adds no
+scheduled coverage or public report publication.
+
+The worker generates the attempt's trace parent. The relay validates the project
+in both the header and payload, but does not pin that worker-generated parent.
+Treat the attempt OTLP token as authority to submit trace attribution within
+this eval project. Keep it limited to the trusted harness/provider runtime;
+never expose it to test prompts or unrelated clients. The project check is not
+an attempt-isolation guarantee. Indexing verification is a separate retained
+or scheduled check; the manual launcher alone does not perform it.
+
+### Hosted report dependencies
+
+The trusted report job applies a reviewed `report-lock.patch` before its frozen
+install. `report-lock.json` pins the input lock, patch and resulting lock hashes.
+This updates existing patch identities and the already declared yaml dependency
+without registry resolution. The worker target and its lock artifact never
+control report dependencies. An unknown committed lock fails before install;
+update and review this correction when dependency inputs change. The original
+failed run remains failed when retained evidence gets a new presentation.
+
+The trusted authorization job checks this correction before catalog/build and
+paid work. Unknown dependency locks fail before model admission. Manual history
+publication applies the same correction before its frozen install. Qualification
+image builds apply it only when target and workflow revisions match; a different
+target keeps its own lock and does not require these reporting helper files.

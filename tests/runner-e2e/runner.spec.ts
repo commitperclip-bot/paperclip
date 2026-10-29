@@ -957,7 +957,7 @@ for (const execution of executions) {
         daytonaImage: process.env.PAPERCLIP_E2E_DAYTONA_IMAGE,
         onCompanyCreated,
       });
-      await finishBudgetedEvalSetup({ executionId: execution.id, agentId: fixtures.agent.id,
+      await finishBudgetedEvalSetup({ executionId: execution.id, environmentId: execution.environment.id, agentId: fixtures.agent.id,
         companyId: fixtures.company.id, deadlineAt: startedAtMs + deadlineMs, api,
         observe: observations => writeSanitizedJson(snapshotsDir, "budgeted-setup.json", { observations }, secrets) });
       await workerTiming.enter("execution");

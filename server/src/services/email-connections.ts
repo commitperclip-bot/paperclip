@@ -15,6 +15,7 @@ import { lockToolConnectionRuntimeInputs, toolAccessService } from "./tool-acces
 import { agentmailApi } from "./agentmail-api.js";
 import { logActivity } from "./activity-log.js";
 import type { EmailActor } from "./email-channels.js";
+import { connectionManagementService } from "./connection-management.js";
 
 export function emailConnectionService(
   db: Db,
@@ -76,6 +77,8 @@ export function emailConnectionService(
     return connection;
   }
   async function listCredentials(companyId: string, actor: EmailActor): Promise<EmailCredentialOption[]> {
+    const management = actor.managementContext;
+    if (actor.agentId && !management) throw forbidden("Connection management authority is required");
     const connections = await db.select().from(toolConnections).where(and(
       eq(toolConnections.companyId, companyId), eq(toolConnections.status, "active"),
       eq(toolConnections.enabled, true),
@@ -92,6 +95,11 @@ export function emailConnectionService(
     await Promise.all(Array.from({ length: Math.min(4, candidates.length) }, async () => {
       while (next < candidates.length) {
         const connection = candidates[next++];
+        if (actor.agentId && management) {
+          const access = await connectionManagementService(db).capability(management.actor, "connections:read",
+            { ...management.resource, connectionId: connection.id }, { mutation: false, readContext: management });
+          if (!access.allowed) continue;
+        }
         try {
           await get(companyId, connection.id, actor);
         } catch (error) {
@@ -176,7 +184,9 @@ export function emailConnectionService(
     input: EmailConnectionInput,
     actor: EmailActor,
   ) {
+    await actor.managementContext?.reauthorize();
     const identity = await agentmailApi(input.apiKey, fetchImpl).whoami();
+    await actor.managementContext?.reauthorize();
     return db.transaction(async (tx) => {
       const db = tx as unknown as Db;
       await db.execute(
@@ -252,8 +262,9 @@ export function emailConnectionService(
           ],
         },
         {
-          actorType: "user",
-          actorId: actor.userId ?? "board",
+          actorType: actor.agentId ? "agent" : "user",
+          actorId: actor.agentId ?? actor.userId ?? "board",
+          managementContext: actor.managementContext,
           actorSource: actor.localImplicit ? "local_implicit" : "session",
         },
       );
@@ -286,8 +297,9 @@ export function emailConnectionService(
               })),
         },
         {
-          actorType: "user",
-          actorId: actor.userId ?? "board",
+          actorType: actor.agentId ? "agent" : "user",
+          actorId: actor.agentId ?? actor.userId ?? "board",
+          managementContext: actor.managementContext,
           actorSource: actor.localImplicit ? "local_implicit" : "session",
         },
       );
@@ -298,8 +310,9 @@ export function emailConnectionService(
       }).where(eq(toolConnections.id, connection.id));
       await logActivity(db, {
         companyId,
-        actorType: "user",
-        actorId: actor.userId ?? "board",
+        actorType: actor.agentId ? "agent" : "user",
+        actorId: actor.agentId ?? actor.userId ?? "board",
+        ...actor.managementContext?.audit,
         action: "email.connection.created",
         entityType: "tool_connection",
         entityId: connection.id,
@@ -357,15 +370,17 @@ export function emailConnectionService(
           ],
         },
         {
-          actorType: "user",
-          actorId: actor.userId ?? "board",
+          actorType: actor.agentId ? "agent" : "user",
+          actorId: actor.agentId ?? actor.userId ?? "board",
+          managementContext: actor.managementContext,
           actorSource: actor.localImplicit ? "local_implicit" : "session",
         },
       );
       await logActivity(db, {
         companyId,
-        actorType: "user",
-        actorId: actor.userId ?? "board",
+        actorType: actor.agentId ? "agent" : "user",
+        actorId: actor.agentId ?? actor.userId ?? "board",
+        ...actor.managementContext?.audit,
         action: replaceInitialAccess ? "email.connection.agents_updated" : "email.connection.agent_added",
         entityType: "tool_connection",
         entityId: id,

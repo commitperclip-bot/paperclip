@@ -4,6 +4,7 @@ import { createConnectionProof } from "../connection-evidence.js";
 import { connectionDelay } from "../connection-target.js";
 import { onboardingFirstTask, type OnboardingFirstTaskInput } from "./onboarding-first-task.js";
 import { validateOnboardingArtifact } from "./artifact-evidence.js";
+import { validateOnboardingPreAcceptanceEvidence } from "./onboarding-pre-acceptance.js";
 
 vi.mock("../connection-target.js", () => ({ connectionDelay: vi.fn(async () => {}) }));
 type Row = { id: string; [key: string]: any };
@@ -92,6 +93,90 @@ function fixture(options: Options = {}) {
 afterEach(() => { vi.restoreAllMocks(); vi.mocked(connectionDelay).mockReset().mockResolvedValue(undefined); });
 
 describe("Cloud canonical onboarding first task", () => {
+  it.each([
+    ["unexpected task set", "unexpected_task_set", (state: Parameters<NonNullable<Options["mutate"]>>[1]) => { state.tasks.push({ id: "private-early-task", title: "private task text", status: "todo" }); }, { taskCount: 2 }],
+    ["attachment", "attachment_present", (state: Parameters<NonNullable<Options["mutate"]>>[1]) => { state.attachments.push({ id: "private-attachment", issueId: "parent", originalFilename: "private-file.txt" }); }, { attachmentCount: 1 }],
+    ["non-planning document", "non_planning_document_present", (state: Parameters<NonNullable<Options["mutate"]>>[1]) => { state.documents.push({ id: "private-document", issueId: "parent", key: "private-result-key", body: "private document body" }); }, { documentCount: 1, nonPlanningDocumentCount: 1 }],
+    ["first task done", "first_task_done", (state: Parameters<NonNullable<Options["mutate"]>>[1]) => { state.tasks[0]!.status = "done"; }, { firstTaskStatus: "done", canonicalParentStatus: "done" }],
+  ] as const)("retains the observed %s violation at the failing acceptance boundary", async (_label, violation, mutate, observed) => {
+    const f = fixture({ mutate(phase, state) { if (phase === "proposal") mutate(state); } });
+    const capture = vi.fn();
+    f.input.onPreAcceptanceFailure = capture;
+    await expect(onboardingFirstTask(f.input)).rejects.toMatchObject({ outcome: "failed", code: "onboarding_work_before_acceptance" });
+    expect(capture).toHaveBeenCalledExactlyOnceWith({ version: 1, checkpoint: "awaiting-proposal", violations: [violation],
+      taskCount: 1, attachmentCount: 0, documentCount: 0, nonPlanningDocumentCount: 0,
+      firstTaskMatchesCanonicalParent: true, firstTaskStatus: "in_review", canonicalParentStatus: "in_review", ...observed });
+    expect(() => validateOnboardingPreAcceptanceEvidence(JSON.parse(JSON.stringify(capture.mock.calls[0]![0])))).not.toThrow();
+    const retained = JSON.stringify(capture.mock.calls[0]![0]);
+    for (const text of ["private-", "parent", "proposal-run", "qa.example.test", "connection", "campaign-1"]) expect(retained).not.toContain(text);
+    expect(f.events).not.toContain("click:Approve");
+  });
+  it("retains every simultaneous guard violation from the same failed snapshot", async () => {
+    const f = fixture({ plan: true, mutate(phase, state) {
+      if (phase !== "proposal") return;
+      state.tasks[0]!.status = "done";
+      state.tasks.push({ id: "private-early-task" });
+      state.attachments.push({ id: "private-attachment", issueId: "parent" });
+      state.documents.push({ id: "private-document", issueId: "parent", key: "private-result", body: "private body" });
+    } });
+    const capture = vi.fn();
+    f.input.onPreAcceptanceFailure = capture;
+    await expect(onboardingFirstTask(f.input)).rejects.toMatchObject({ code: "onboarding_work_before_acceptance" });
+    expect(capture).toHaveBeenCalledExactlyOnceWith({ version: 1, checkpoint: "awaiting-proposal",
+      violations: ["unexpected_task_set", "attachment_present", "non_planning_document_present", "first_task_done"],
+      taskCount: 2, attachmentCount: 1, documentCount: 2, nonPlanningDocumentCount: 1,
+      firstTaskMatchesCanonicalParent: true, firstTaskStatus: "done", canonicalParentStatus: "done" });
+    expect(f.events).not.toContain("click:Confirm selection");
+  });
+  it.each(["missing", "replaced", "reordered", "unknown-status"] as const)("records closed task observations when the snapshot is %s", async mode => {
+    const f = fixture({ mutate(phase, state) {
+      if (phase !== "proposal") return;
+      if (mode === "missing") state.tasks = [];
+      if (mode === "replaced") state.tasks = [{ id: "private-replacement", status: "done" }];
+      if (mode === "reordered") state.tasks.unshift({ id: "private-first", status: "done" });
+      if (mode === "unknown-status") { state.tasks[0]!.status = "private future status"; state.attachments.push({ id: "private-attachment", issueId: "parent" }); }
+    } });
+    const capture = vi.fn();
+    f.input.onPreAcceptanceFailure = capture;
+    await expect(onboardingFirstTask(f.input)).rejects.toMatchObject({ code: "onboarding_work_before_acceptance" });
+    expect(capture).toHaveBeenCalledOnce();
+    expect(capture.mock.calls[0]![0]).toMatchObject({
+      violations: mode === "unknown-status" ? ["attachment_present"] : mode === "missing" ? ["unexpected_task_set"] : ["unexpected_task_set", "first_task_done"],
+      taskCount: mode === "missing" ? 0 : mode === "reordered" ? 2 : 1,
+      firstTaskMatchesCanonicalParent: mode === "unknown-status",
+      firstTaskStatus: mode === "missing" ? "missing" : mode === "unknown-status" ? "unknown" : "done",
+      canonicalParentStatus: mode === "reordered" ? "in_review" : mode === "unknown-status" ? "unknown" : "missing",
+    });
+    expect(JSON.stringify(capture.mock.calls[0]![0])).not.toContain("private");
+    expect(f.events).not.toContain("click:Approve");
+  });
+  it("retains an opening-boundary failure before the opening answer dispatches work", async () => {
+    const f = fixture({ mutate(phase, state) { if (phase === "opening") state.tasks[0]!.status = "done"; } });
+    const capture = vi.fn();
+    f.input.onPreAcceptanceFailure = capture;
+    await expect(onboardingFirstTask(f.input)).rejects.toMatchObject({ code: "onboarding_work_before_acceptance" });
+    expect(capture).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ checkpoint: "before-opening-answer", violations: ["first_task_done"] }));
+    expect(f.events).not.toContain("click:Continue");
+  });
+  it("does not claim the first-slot Done guard when only a later canonical parent is Done", async () => {
+    const f = fixture({ mutate(phase, state) {
+      if (phase !== "proposal") return;
+      state.tasks[0]!.status = "done";
+      state.tasks.unshift({ id: "private-first", status: "todo" });
+    } });
+    const capture = vi.fn();
+    f.input.onPreAcceptanceFailure = capture;
+    await expect(onboardingFirstTask(f.input)).rejects.toMatchObject({ code: "onboarding_work_before_acceptance" });
+    expect(capture).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ violations: ["unexpected_task_set"],
+      firstTaskMatchesCanonicalParent: false, firstTaskStatus: "todo", canonicalParentStatus: "done" }));
+  });
+  it.each([false, true])("does not retain failure snapshots during clean canonical success, plan mode %s", async plan => {
+    const f = fixture({ plan });
+    const capture = vi.fn();
+    f.input.onPreAcceptanceFailure = capture;
+    await expect(onboardingFirstTask(f.input)).resolves.toMatchObject({ onboardingIssueId: "parent", childIssueId: "child" });
+    expect(capture).not.toHaveBeenCalled();
+  });
   it.each(["reload", "download-link"] as const)("retains the independently verified download when later %s fails", async readbackFailure => {
     const f = fixture({ readbackFailure });
     const capture = vi.fn();

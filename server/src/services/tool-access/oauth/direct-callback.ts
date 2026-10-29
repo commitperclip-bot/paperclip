@@ -270,6 +270,7 @@ export function createDirectOAuthCallback(db: Db, dependencies: Dependencies) {
               // different scopes. The connection-level list is whichever callback ran last,
               // so it is the wrong baseline for anyone else's refresh.
               requestedScopes: authorizedScopes,
+              consentedAt: connectedAt.toISOString(),
               tokenType: token.tokenType,
               refreshedAt: connectedAt.toISOString(),
             },

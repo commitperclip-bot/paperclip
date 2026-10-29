@@ -118,7 +118,8 @@ ownership manifests. An expired lease permits cleanup recovery, not reuse.
 Managed self-hosted instances are removed after every attempt. Existing Cloud
 stacks retain the QA account and declared baseline while removing verified
 run-owned fixtures. Successful disposable stacks are deleted. Failed disposable
-stacks are stopped and retained for 24 hours, then swept. Interrupted cleanup
+stacks are stopped and retained for up to 24 hours. The deployment provider
+declares earlier cleanup eligibility to leave time for its sweeper. Interrupted cleanup
 remains visible and retains exclusive stack ownership. QA identity and inbox
 never belong to disposable ownership.
 

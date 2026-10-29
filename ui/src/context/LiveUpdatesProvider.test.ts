@@ -16,6 +16,24 @@ import { __liveUpdatesTestUtils } from "./LiveUpdatesProvider";
 import { queryKeys } from "../lib/queryKeys";
 
 describe("LiveUpdatesProvider issue invalidation", () => {
+  it("refreshes saved project access with permission saves and live agent activity", async () => {
+    const client = new QueryClient();
+    const target = queryKeys.agents.projectAccess("agent-1");
+    const other = queryKeys.agents.projectAccess("agent-2");
+    client.setQueryData(target, { projectIds: [] });
+    client.setQueryData(other, { projectIds: ["other-project"] });
+    await client.invalidateQueries({ queryKey: queryKeys.agents.detail("agent-1") });
+    expect(client.getQueryState(target)?.isInvalidated).toBe(true);
+    expect(client.getQueryState(other)?.isInvalidated).toBe(false);
+    client.setQueryData(target, { projectIds: ["project-1"] });
+    __liveUpdatesTestUtils.invalidateActivityQueries(client, "company-1", {
+      entityType: "agent", entityId: "agent-1", action: "agent.permissions_updated",
+    }, { userId: "user-1", agentId: null });
+    expect(client.getQueryState(target)?.isInvalidated).toBe(true);
+    expect(client.getQueryState(other)?.isInvalidated).toBe(false);
+    client.clear();
+  });
+
   it('refreshes sources, legacy repositories and installed skills after a background import', () => {
     const client = new QueryClient();
     const invalidate = vi.spyOn(client, 'invalidateQueries');

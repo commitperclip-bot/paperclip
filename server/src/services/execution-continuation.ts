@@ -31,6 +31,28 @@ const object = (v: unknown): Record<string, unknown> =>
     : {};
 const string = (v: unknown) =>
   typeof v === "string" && v.length > 0 ? v : null;
+const historyResult = sql<Record<string, unknown> | null>`case
+  when jsonb_typeof(${heartbeatRuns.resultJson}) = 'object' then (
+    select coalesce(jsonb_object_agg(field.key, case
+      when field.key = 'apiToolReceipts' and jsonb_typeof(field.value) = 'object' then (
+        select coalesce(jsonb_object_agg(receipt.key, (
+          select jsonb_object_agg(detail.key, detail.value)
+          from jsonb_each(receipt.value) as detail(key, value)
+          where detail.key in ('state', 'operationId', 'result')
+        )), '{}'::jsonb)
+        from jsonb_each(field.value) as receipt(key, value)
+        where receipt.value->'state' = '"completed"'::jsonb
+          and jsonb_typeof(receipt.value->'operationId') = 'string'
+      )
+      when field.key = 'workspaceRestoreRecovery' and jsonb_typeof(field.value) = 'object' then (
+        select coalesce(jsonb_object_agg(detail.key, detail.value), '{}'::jsonb)
+        from jsonb_each(field.value) as detail(key, value)
+        where detail.key = 'schema'
+      )
+      else field.value end), '{}'::jsonb)
+    from jsonb_each(${heartbeatRuns.resultJson}) as field(key, value)
+    where field.key in ('apiToolReceipts', 'conversationContinuation', 'workspaceRestoreFailure', 'workspaceRestoreRecovery')
+  ) else ${heartbeatRuns.resultJson} end`;
 export function continuationOriginCommentIds(context: unknown): string[] {
   const c = object(context);
   const prior = object(c.executionContinuation);
@@ -197,25 +219,44 @@ export async function buildExecutionContinuation(input: {
   );
   const explicitContinuation = object(input.context.explicitUserContinuation);
   const explicitUserSource = string(explicitContinuation.previousRunId);
+  const interruptedSource = string(input.context.interruptedRunId);
   const resumeSourceRunId =
     explicitUserSource ??
     string(input.context.retryOfRunId) ??
     string(input.context.previousRunId) ??
-    string(input.context.interruptedRunId);
+    interruptedSource;
   const producerRunId = triggerInteraction?.sourceRunId ?? null;
-  const sourceRunId = resumeSourceRunId ?? producerRunId;
+  const requestedSourceRunId = resumeSourceRunId ?? producerRunId;
   const loadRun = async (id: string) => (await db
     .select({ context: heartbeatRuns.contextSnapshot, result: heartbeatRuns.resultJson })
     .from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, id)))
   )[0];
-  const candidate = sourceRunId ? await loadRun(sourceRunId) : null;
+  const candidate = requestedSourceRunId ? await loadRun(requestedSourceRunId) : null;
   // An interaction producer is provenance. Explicit resume history must still
   // belong to this task, and only task-scoped content can enter the envelope.
   const sourceRun = object(candidate?.context).issueId === issueId ? candidate : null;
-  if ((sourceRunId && !candidate) || (resumeSourceRunId && !sourceRun))
+  // interruptedRunId is a best-effort hint written when a run is interrupted.
+  // After a cross-issue reassign it can name another task's run or a deleted
+  // row. Unlike an explicit user resume or a retry chain, a hint that does
+  // not resolve to this task must not fail the whole wake: degrade to "no
+  // resume source" and continue.
+  const staleInterruptedSource =
+    interruptedSource !== null
+    && resumeSourceRunId === interruptedSource
+    && explicitUserSource === null
+    && string(input.context.retryOfRunId) === null
+    && string(input.context.previousRunId) === null
+    && sourceRun === null;
+  // A degraded hint falls back to the interaction producer so interaction
+  // wakes keep their source attribution.
+  const sourceRunId = staleInterruptedSource ? (producerRunId ?? null) : requestedSourceRunId;
+  if (
+    !staleInterruptedSource
+    && ((requestedSourceRunId && !candidate) || (resumeSourceRunId && !sourceRun))
+  )
     throw new Error(explicitUserSource ? "continuation_user_authorization_missing" : "continuation_source_context_missing");
-  const producer = producerRunId === sourceRunId ? candidate
+  const producer = producerRunId === requestedSourceRunId ? candidate
     : producerRunId ? await loadRun(producerRunId) : null;
   if (producerRunId && !producer) throw new Error("continuation_source_context_missing");
   const producerIssueId = string(object(producer?.context).issueId);
@@ -316,7 +357,7 @@ export async function buildExecutionContinuation(input: {
       ? { kind: "description" as const, id: issue.id, revision: hashObjectiveSource(issue.description) }
       : { kind: "title" as const, id: issue.id, revision: hashObjectiveSource(issue.title) };
   const priorRuns = await db
-    .select({ id: heartbeatRuns.id, result: heartbeatRuns.resultJson, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, runtimeMode: heartbeatRuns.runtimeMode, retryOfRunId: heartbeatRuns.retryOfRunId })
+    .select({ id: heartbeatRuns.id, result: historyResult, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, runtimeMode: heartbeatRuns.runtimeMode, retryOfRunId: heartbeatRuns.retryOfRunId })
     .from(heartbeatRuns)
     .where(
       and(
@@ -431,7 +472,7 @@ export async function buildExecutionContinuation(input: {
     if (!predecessor || !authorization || explicitUserSource !== sourceRunId)
       throw new Error("continuation_user_authorization_missing");
   }
-  const interruptedRunId = explicitUserSource ?? string(input.context.interruptedRunId) ?? (lastTerminal && lastTerminal.status !== "succeeded" &&
+  const interruptedRunId = explicitUserSource ?? (staleInterruptedSource ? undefined : interruptedSource) ?? (lastTerminal && lastTerminal.status !== "succeeded" &&
     (hasConversationContinuationPolicy(lastTerminal.result) ||
       lastTerminal.status === "interrupted" || lastTerminal.errorCode === "process_lost")
     ? lastTerminal.id : undefined);

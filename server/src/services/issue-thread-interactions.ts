@@ -1,3 +1,4 @@
+import { notifyToolReviewChange } from "./tool-review-work-notifications.js";
 import { normalizeEscapedLineBreaks } from "@paperclipai/shared/validators/text";
 import { notifyDeliveryWork, DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { historicalQuestionCondition } from "./issue-question-context.js";
@@ -1072,8 +1073,22 @@ class InteractionResolvedConcurrentlyError extends Error {
 // tool_action_requests row. Administrative resolutions (withdraw, terminal-issue
 // expiry) must settle that row too, or the parked call stays approvable under
 // its own one-hour lifecycle after its card is gone.
+async function hasLinkedToolActionRequests(db: Pick<Db, "select">, companyId: string, interactionIds: string[]) {
+  if (interactionIds.length === 0) return false;
+  const [request] = await db.select({ id: toolActionRequests.id }).from(toolActionRequests)
+    .where(and(eq(toolActionRequests.companyId, companyId), inArray(toolActionRequests.interactionId, interactionIds)))
+    .limit(1);
+  return request !== undefined;
+}
+
+async function notifyToolProjectionForInteractions(db: Pick<Db, "select">, companyId: string, interactionIds: string[]) {
+  // The persisted link also covers legacy cards without current payload flags.
+  if (await hasLinkedToolActionRequests(db, companyId, interactionIds))
+    await notifyDeliveryWork(db, DELIVERY_QUEUES.toolReviewProjection, companyId);
+}
+
 async function resolveLinkedToolActionRequests(
-  db: Pick<Db, "update">,
+  db: Pick<Db, "select" | "update">,
   interaction: Pick<IssueThreadInteractionRow, "id" | "companyId" | "kind">,
   outcome: {
     status: "expired" | "cancelled";
@@ -1082,7 +1097,9 @@ async function resolveLinkedToolActionRequests(
     now: Date;
   },
 ) {
-  if (interaction.kind !== "request_confirmation") return;
+  if (interaction.kind !== "request_confirmation" ||
+    !(await hasLinkedToolActionRequests(db, interaction.companyId, [interaction.id]))) return;
+  await notifyToolReviewChange(db, interaction.companyId);
   await db
     .update(toolActionRequests)
     .set({
@@ -1159,6 +1176,7 @@ async function resolveLinkedSecretProposal(
 ) {
   const proposalId = linkedSecretProposalId(interaction);
   if (!proposalId) return;
+  await notifyDeliveryWork(db, DELIVERY_QUEUES.secretProposalExpiry, interaction.companyId);
   const [proposal] = await db
     .update(companySecretProposals)
     .set({
@@ -2237,6 +2255,7 @@ export function issueThreadInteractionService(
             })
           : undefined;
 
+      if (lockedCurrent.kind === "request_confirmation") await notifyToolProjectionForInteractions(tx, lockedCurrent.companyId, [lockedCurrent.id]);
       const [updated] = await tx
         .update(issueThreadInteractions)
         .set({
@@ -2514,6 +2533,7 @@ export function issueThreadInteractionService(
         now,
       });
 
+      if (lockedCurrent.kind === "request_confirmation") await notifyToolProjectionForInteractions(tx, lockedCurrent.companyId, [lockedCurrent.id]);
       const [resolved] = await tx
         .update(issueThreadInteractions)
         .set({
@@ -2613,6 +2633,16 @@ export function issueThreadInteractionService(
       },
     ) => {
       const payload = connectionIntentPayloadSchema.parse(input.payload);
+      const sameSavedSetup = (candidate: typeof payload) =>
+        candidate.savedSetup?.endpointId === payload.savedSetup?.endpointId
+        && candidate.savedSetup?.connectionId === payload.savedSetup?.connectionId
+        && candidate.savedSetup?.action === payload.savedSetup?.action
+        && Boolean(candidate.savedSetup?.credentialRotation) === Boolean(payload.savedSetup?.credentialRotation)
+        && candidate.savedSetup?.credentialEntry?.requireAll === payload.savedSetup?.credentialEntry?.requireAll
+        // Preserve the original generation boundary on retries, while keeping
+        // requests for different credential fields distinct.
+        && isDeepStrictEqual(Object.keys(candidate.savedSetup?.credentialEntry?.previousGenerations ?? {}).sort(),
+          Object.keys(payload.savedSetup?.credentialEntry?.previousGenerations ?? {}).sort());
       const existing = await getIdempotentInteraction({
         issueId: issue.id,
         companyId: issue.companyId,
@@ -2624,7 +2654,7 @@ export function issueThreadInteractionService(
           || existing.sourceRunId !== input.sourceRunId
           || existing.addresseeUserId !== input.addresseeUserId
           || (existing.kind === "connection_intent"
-            ? (connectionIntentPayloadSchema.parse(existing.payload).serviceSlug !== payload.serviceSlug || connectionIntentPayloadSchema.parse(existing.payload).purpose !== payload.purpose || !isDeepStrictEqual(connectionIntentPayloadSchema.parse(existing.payload).accessRequest, payload.accessRequest))
+            ? (connectionIntentPayloadSchema.parse(existing.payload).serviceSlug !== payload.serviceSlug || connectionIntentPayloadSchema.parse(existing.payload).purpose !== payload.purpose || !sameSavedSetup(connectionIntentPayloadSchema.parse(existing.payload)) || !isDeepStrictEqual(connectionIntentPayloadSchema.parse(existing.payload).accessRequest, payload.accessRequest))
             : !isDeepStrictEqual(existing.payload, payload))
         ) {
           throw conflict(
@@ -2663,7 +2693,7 @@ export function issueThreadInteractionService(
           eq(issueThreadInteractions.addresseeUserId, input.addresseeUserId),
         ));
         const reusable = pending.find((candidate) =>
-          connectionIntentPayloadSchema.parse(candidate.payload).serviceSlug === payload.serviceSlug && connectionIntentPayloadSchema.parse(candidate.payload).purpose === payload.purpose && isDeepStrictEqual(connectionIntentPayloadSchema.parse(candidate.payload).accessRequest, payload.accessRequest));
+          connectionIntentPayloadSchema.parse(candidate.payload).serviceSlug === payload.serviceSlug && connectionIntentPayloadSchema.parse(candidate.payload).purpose === payload.purpose && sameSavedSetup(connectionIntentPayloadSchema.parse(candidate.payload)) && isDeepStrictEqual(connectionIntentPayloadSchema.parse(candidate.payload).accessRequest, payload.accessRequest));
         if (reusable) {
           await enqueueIssueInteractionChatPublications(tx as unknown as Db, hydrateInteraction(reusable));
           return reusable;
@@ -2689,8 +2719,11 @@ export function issueThreadInteractionService(
             sourceRunId: input.sourceRunId,
             originCommentIds,
             sourceIdentityContextId: input.sourceIdentityContextId ?? null,
-            title: payload.accessRequest ? `Grant ${payload.serviceName} access to ${payload.requestingAgentName}?` : `Connect ${payload.serviceName}`,
-            summary: `${payload.requestingAgentName} needs this connection to continue.`,
+            title: payload.accessRequest ? `Grant ${payload.serviceName} access to ${payload.requestingAgentName}?`
+              : payload.savedSetup?.action === "rotate_credentials" ? `Rotate ${payload.serviceName} webhook secret` : `Connect ${payload.serviceName}`,
+            summary: payload.savedSetup?.action === "rotate_credentials"
+              ? `${payload.requestingAgentName} needs you to rotate the signing secret and reconnect the saved App.`
+              : `${payload.requestingAgentName} needs this connection to continue.`,
             createdByAgentId: payload.requestingAgentId,
             addresseeUserId: input.addresseeUserId,
             payload,
@@ -3168,6 +3201,7 @@ export function issueThreadInteractionService(
           : execution.status;
         if (executionStatus === "failed" && proposal.status === "pending") {
           const resolutionReason = `Interaction acceptance failed: ${execution.errorCode ?? "secret_proposal_execution_failed"}`;
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.secretProposalExpiry, proposal.companyId);
           await tx
             .update(companySecretProposals)
             .set({
@@ -3256,6 +3290,7 @@ export function issueThreadInteractionService(
       const cancelled: IssueThreadInteraction[] = [];
       for (const row of rows) {
         const updated = await db.transaction(async (tx) => {
+          if (row.kind === "request_confirmation") await notifyToolProjectionForInteractions(tx, row.companyId, [row.id]);
           const [resolved] = await tx
             .update(issueThreadInteractions)
             .set({
@@ -3340,6 +3375,7 @@ export function issueThreadInteractionService(
       const expired: IssueThreadInteraction[] = [];
       for (const { row, replacementInteractionId } of supersededRows) {
         const updated = await db.transaction(async (tx) => {
+          if (row.kind === "request_confirmation") await notifyToolProjectionForInteractions(tx, row.companyId, [row.id]);
           const [updatedRow] = await tx
             .update(issueThreadInteractions)
             .set({
@@ -3759,6 +3795,19 @@ export function issueThreadInteractionService(
             data.kind === "ask_user_questions"
               ? buildSupersededByNewerInteractionResult(row.id)
               : buildSupersededByNewerRequestResult(row.id);
+          const siblingCondition = and(
+            eq(issueThreadInteractions.companyId, issue.companyId),
+            eq(issueThreadInteractions.issueId, issue.id),
+            eq(issueThreadInteractions.kind, data.kind),
+            eq(issueThreadInteractions.createdByAgentId, actor.agentId),
+            eq(issueThreadInteractions.status, "pending"),
+            ne(issueThreadInteractions.id, row.id),
+          );
+          if (data.kind === "request_confirmation") {
+            // The issue lock above excludes concurrent interaction creation.
+            const siblings = await tx.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(siblingCondition);
+            await notifyToolProjectionForInteractions(tx, issue.companyId, siblings.map(sibling => sibling.id));
+          }
           const supersededRows = await tx
             .update(issueThreadInteractions)
             .set({
@@ -3769,17 +3818,7 @@ export function issueThreadInteractionService(
               resolvedAt: now,
               updatedAt: now,
             })
-            .where(
-              and(
-                eq(issueThreadInteractions.companyId, issue.companyId),
-                eq(issueThreadInteractions.issueId, issue.id),
-                eq(issueThreadInteractions.kind, data.kind),
-                eq(issueThreadInteractions.createdByAgentId, actor.agentId),
-                eq(issueThreadInteractions.status, "pending"),
-                ne(issueThreadInteractions.id, row.id),
-
-              ),
-            )
+            .where(siblingCondition)
             .returning();
           for (const supersededRow of supersededRows) {
             await resolveLinkedToolActionRequests(tx, supersededRow, {
@@ -4425,6 +4464,7 @@ export function issueThreadInteractionService(
               .delete(toolOauthStates)
               .where(eq(toolOauthStates.interactionId, row.id));
           }
+          if (row.kind === "request_confirmation") await notifyToolProjectionForInteractions(tx, row.companyId, [row.id]);
           const [resolved] = await tx
             .update(issueThreadInteractions)
             .set({
@@ -4593,6 +4633,7 @@ export function issueThreadInteractionService(
           );
           if (!sampleConfirmationRow) continue;
           const updatedInteractions = await db.transaction(async (tx) => {
+            await notifyToolProjectionForInteractions(tx, issue.companyId, confirmationRowIds);
             const updatedRows = await tx
               .update(issueThreadInteractions)
               .set({

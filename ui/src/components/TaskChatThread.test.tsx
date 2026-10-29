@@ -6,6 +6,7 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "@/context/ThemeContext";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TaskChatThread } from "./TaskChatThread";
 import { IssueChatThread } from "./IssueChatThread";
@@ -26,6 +27,7 @@ const transcriptState = vi.hoisted(() => ({
   transcriptByRun: new Map(),
   isInitialHydrating: false,
   hydratedRunIds: undefined as Set<string> | undefined,
+  truncatedRunIds: new Set<string>(),
 }));
 const nativeTranscriptState = vi.hoisted(() => ({
   transcriptByRun: new Map(),
@@ -35,6 +37,7 @@ const nativeTranscriptState = vi.hoisted(() => ({
 }));
 const transcriptHookRuns = vi.hoisted(() => ({
   legacy: [] as unknown[][],
+  legacyReadLimits: [] as (number | undefined)[],
   native: [] as unknown[][],
 }));
 const sidebarState = vi.hoisted(() => ({ isMobile: false }));
@@ -51,12 +54,14 @@ const editorCallbacks = vi.hoisted(() => ({ change: (_value: string) => {} }));
 const streamlinedState = vi.hoisted(() => ({ enabled: true }));
 
 vi.mock("@/components/transcript/useLiveRunTranscripts", () => ({
-  useLiveRunTranscripts: ({ runs }: { runs: unknown[] }) => {
+  useLiveRunTranscripts: ({ runs, logReadLimitBytes }: { runs: unknown[]; logReadLimitBytes?: number }) => {
     transcriptHookRuns.legacy.push(runs);
+    transcriptHookRuns.legacyReadLimits.push(logReadLimitBytes);
     return {
       transcriptByRun: new Map(transcriptState.transcriptByRun),
       isInitialHydrating: transcriptState.isInitialHydrating,
       hydratedRunIds: transcriptState.hydratedRunIds,
+      truncatedRunIds: transcriptState.truncatedRunIds,
     };
   },
 }));
@@ -122,11 +127,13 @@ beforeEach(() => {
   transcriptState.transcriptByRun.clear();
   transcriptState.isInitialHydrating = false;
   transcriptState.hydratedRunIds = undefined;
+  transcriptState.truncatedRunIds.clear();
   nativeTranscriptState.transcriptByRun.clear();
   nativeTranscriptState.errorsByRun.clear();
   nativeTranscriptState.hydratedRunIds = undefined;
   nativeTranscriptState.terminalHydratedRunIds = undefined;
   transcriptHookRuns.legacy.length = 0;
+  transcriptHookRuns.legacyReadLimits.length = 0;
   transcriptHookRuns.native.length = 0;
   sidebarState.isMobile = false;
   planState.data = null;
@@ -155,7 +162,7 @@ function render(ui: ReactElement) {
   flushSync(() =>
     root!.render(
       <QueryClientProvider client={queryClient}>
-        <ThemeProvider>{ui}</ThemeProvider>
+        <ThemeProvider><TooltipProvider>{ui}</TooltipProvider></ThemeProvider>
       </QueryClientProvider>,
     ),
   );
@@ -361,6 +368,37 @@ it.each([true, false])("defers hidden content until history is ready and keeps i
   expect(container.querySelector('.task-chat-history-pending')).toBeNull();
 });
 
+it.each([true, false])("keeps cold-open messages readable while history is pending (mobile=%s)", (mobile) => {
+  sidebarState.isMobile = mobile;
+  render(<TaskChatThread issueId="cold-issue" compactHistory initialHistoryPending
+    comments={createLongThreadComments()} historyControl={<button>More messages</button>} onAdd={async () => {}} />);
+  expect(container.querySelector('[data-testid="task-chat-history-loading"]')).toBeNull();
+  expect(container.textContent).toContain("Thread message 1");
+  expect(container.textContent).toContain("More messages");
+  expect(container.querySelector('[data-testid="mock-editor"]')).not.toBeNull();
+});
+
+it.each([0, 32_000, 100_000])("offers earlier output only when a single legacy run exceeds the compact window (%s bytes)", (logBytes) => {
+  const onExpandHistory = vi.fn();
+  if (logBytes > 32_000) transcriptState.truncatedRunIds.add("legacy-run");
+  const props = {
+    issueId: "single-legacy-run", comments: [], onAdd: async () => {}, onExpandHistory,
+    linkedRuns: [{ runId: "legacy-run", agentId: "agent", status: "succeeded", adapterType: "claude_local", runtimeMode: "legacy" as const, createdAt: "2025-01-01T10:00:00Z", startedAt: "2025-01-01T10:00:00Z", logBytes }],
+  };
+  render(<TaskChatThread {...props} compactHistory />);
+  expect(container.textContent).not.toContain("More messages");
+  const outputControl = [...container.querySelectorAll("button")].find((button) => button.textContent === "More run output");
+  expect(Boolean(outputControl)).toBe(logBytes > 32_000);
+  expect(transcriptHookRuns.legacyReadLimits.at(-1)).toBe(32_000);
+  if (outputControl) {
+    act(() => outputControl.click());
+    expect(onExpandHistory).toHaveBeenCalledOnce();
+    render(<TaskChatThread {...props} compactHistory={false} />);
+    expect(container.textContent).not.toContain("More run output");
+    expect(transcriptHookRuns.legacyReadLimits.at(-1)).toBeUndefined();
+  }
+});
+
 it("defers initial history for a saved conversation with its own draft key", () => {
   render(<TaskChatThread comments={[]} onAdd={async () => {}} issueId="saved-chat"
     conversationMode draftKey="agent-chat:company:saved-agent" initialHistoryPending />);
@@ -422,17 +460,19 @@ it("shows Thinking during admission and clears it when the saved follow-up enter
 
 it.each((["task", "legacy"] as const).flatMap(surface =>
   ([null, "failed", "resolved"] as const).map(previousState => ({ surface, previousState })),
-))("keeps $surface admission Thinking through an old $previousState projection until acknowledgement", async ({ surface, previousState }) => {
+))("keeps $surface admission identity through an old $previousState projection and comment acknowledgement", async ({ surface, previousState }) => {
   let acknowledge!: () => void;
-  const onAdd = vi.fn(() => new Promise<void>(resolve => { acknowledge = resolve; }));
+  const onAdd = vi.fn<ComponentProps<typeof TaskChatThread>["onAdd"]>(() => new Promise<void>(resolve => { acknowledge = resolve; }));
   const refresh = vi.fn();
   const Component = surface === "task" ? TaskChatThread : IssueChatThread;
-  render(<Component comments={[]} issueId="issue" issueAssigneeAgentId="agent"
-    issueStatus="todo" onAdd={onAdd} onRefreshLatestComments={refresh}
+  const props = { comments: [], issueId: "issue", issueAssigneeAgentId: "agent", issueStatus: "todo", onAdd,
+    onRefreshLatestComments: refresh,
+    agentMap: new Map([["agent", { id: "agent", name: "Worker", adapterType: "paperclip_runner" } as Agent]]) };
+  render(<Component {...props}
     interruption={previousState ? { intentId: "previous-intent", responsibility: "system", state: previousState,
       nextRetryAt: null, canRetry: previousState === "failed", userAction: null,
       sourceRunIds: ["previous-run"], observedRunId: "previous-run" } : null}
-    agentMap={new Map([["agent", { id: "agent", name: "Worker", adapterType: "paperclip_runner" } as Agent]])} />);
+    />);
   await act(async () => { editorCallbacks.change("Save this note."); });
   const send = surface === "task"
     ? container.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-send"]')
@@ -443,15 +483,82 @@ it.each((["task", "legacy"] as const).flatMap(surface =>
     await act(async () => { send!.click(); });
     expect(onAdd).toHaveBeenCalledTimes(1);
     expect(container.textContent).toContain("Thinking");
+    const identity = container.querySelector('[data-testid="task-chat-agent-identity"]');
+    render(<Component {...props} composerDisabledReason="Could not load task pause state." />);
+    expect(container.querySelector('[data-testid="task-chat-agent-identity"]')).toBe(identity);
     await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
     expect(container.textContent).toContain("Taking longer than usual");
     expect(refresh).toHaveBeenCalledTimes(1);
     await act(async () => { acknowledge(); });
-    expect(container.textContent).not.toContain("Thinking");
-    expect(container.textContent).not.toContain("Taking longer than usual");
+    expect(container.querySelector('[data-testid="task-chat-agent-identity"]')).toBe(identity);
+    expect(container.textContent).toContain("Taking longer than usual");
+    render(<Component {...props} interruption={{ intentId: "new-intent", responsibility: "system", state: "retry_scheduled",
+      nextRetryAt: new Date(Date.now() + 30_000).toISOString(), canRetry: true, userAction: null,
+      sourceRunIds: [], observedRunId: null }} />);
+    expect(container.querySelector('[data-testid="task-chat-agent-identity"]')).toBeNull();
   } finally {
     vi.useRealTimers();
   }
+});
+
+it.each((["task", "legacy"] as const).flatMap(surface =>
+  [-300_000, 0, 300_000].map(clockOffset => ({ surface, clockOffset })),
+))("keeps an existing $surface thread's responder mounted with clock offset $clockOffset", async ({ surface, clockOffset }) => {
+  const serverTime = new Date("2026-01-02T00:00:00Z").getTime();
+  vi.spyOn(Date, "now").mockReturnValue(serverTime + clockOffset);
+  const Component = surface === "task" ? TaskChatThread : IssueChatThread;
+  let acknowledge!: () => void;
+  const onAdd = vi.fn<ComponentProps<typeof TaskChatThread>["onAdd"]>(() => new Promise<void>(resolve => { acknowledge = resolve; }));
+  const prior = { id: "prior-reply", companyId: "company", issueId: "issue", authorType: "agent" as const,
+    authorAgentId: "agent", authorUserId: null, body: "Here is the previous answer.", presentation: null, metadata: null,
+    createdAt: new Date("2026-01-01"), updatedAt: new Date("2026-01-01") };
+  const props = { issueId: "issue", issueStatus: "in_progress", currentUserId: "board", issueAssigneeAgentId: "agent", onAdd,
+    comments: [prior], agentMap: new Map([["agent", { id: "agent", name: "Worker", adapterType: "paperclip_runner" } as Agent]]) };
+  render(<Component {...props} />);
+  await act(async () => { editorCallbacks.change("Please check again."); });
+  const send = surface === "task" ? container.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-send"]')
+    : [...container.querySelectorAll<HTMLButtonElement>('[data-testid="issue-chat-composer"] button')].find(button => button.textContent === "Send");
+  await act(async () => { send!.click(); });
+  expect(onAdd).toHaveBeenCalledTimes(1);
+  const identity = container.querySelectorAll('[data-testid="task-chat-agent-identity"]');
+  const responder = identity[identity.length - 1];
+  const avatar = responder?.querySelector("img");
+  expect(responder?.textContent).toBe("Worker");
+  expect(avatar).not.toBeNull();
+  const saved = { ...prior, id: "saved-message", authorType: "user" as const, authorAgentId: null, authorUserId: "board",
+    body: "Please check again.", clientRequestId: onAdd.mock.calls[0]?.[4], createdAt: new Date(serverTime), updatedAt: new Date(serverTime) };
+  render(<Component {...props} comments={[prior, saved]} />);
+  await act(async () => { acknowledge(); });
+  expect(container.contains(responder)).toBe(true);
+  expect(responder.querySelector("img")).toBe(avatar);
+  render(<Component {...props} comments={[prior, saved]} linkedRuns={[{
+    runId: "older-run", agentId: "agent", status: "succeeded", createdAt: "2026-01-01", startedAt: "2026-01-01",
+  }]} />);
+  expect(container.contains(responder)).toBe(true);
+  render(<Component {...props} comments={[prior, saved]} linkedRuns={[{
+    runId: "new-run", agentId: "agent", status: "succeeded", createdAt: new Date(serverTime + 1), startedAt: new Date(serverTime + 1),
+  }]} />);
+  expect(container.contains(responder)).toBe(false);
+});
+
+it.each((["task", "legacy"] as const).flatMap(surface => [
+  ...(["paused", "pending_approval", "terminated"] as const).map(status => ({ surface, reason: status, status, orgChainHealth: undefined })),
+  ...(["missing_manager", "terminated_ancestor", "cycle"] as const).map(reason => ({ surface, reason, status: "idle" as const,
+    orgChainHealth: { status: "invalid_org_chain", reason } as Agent["orgChainHealth"] })),
+]))("does not show startup work with $reason in $surface chat", async ({ surface, status, orgChainHealth }) => {
+  const Component = surface === "task" ? TaskChatThread : IssueChatThread;
+  const onAdd = vi.fn<ComponentProps<typeof TaskChatThread>["onAdd"]>().mockResolvedValue(undefined);
+  const agentMap = new Map([["agent", { id: "agent", name: "Worker", status, orgChainHealth, adapterType: "paperclip_runner" } as Agent]]);
+  const props = { issueId: "issue", comments: [], issueStatus: "todo", issueAssigneeAgentId: "agent", agentMap, onAdd };
+  render(<Component {...props} />);
+  await act(async () => { editorCallbacks.change("Save a note for later."); });
+  const send = surface === "task" ? container.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-send"]')
+    : [...container.querySelectorAll<HTMLButtonElement>('[data-testid="issue-chat-composer"] button')].find(button => button.textContent === "Send");
+  await act(async () => { send!.click(); });
+  expect(onAdd).toHaveBeenCalledTimes(1);
+  expect(container.querySelector('[data-testid="task-chat-agent-identity"]')).toBeNull();
+  expect(container.textContent).not.toContain("Thinking");
+  expect(container.textContent).not.toContain("Taking longer than usual");
 });
 
 it("prepares comment-link history and its composer before reveal", async () => {
@@ -1075,7 +1182,7 @@ describe("TaskChatThread runtime transcript selection", () => {
     expect(nativeRuns.map((run) => run.id)).toEqual(["native-run"]);
   });
 
-  it.each([false, true])("keeps the runner identity and activity mounted through startup (mobile=%s)", (mobile) => {
+  it.each([false, true])("keeps the runner identity and activity mounted through startup (mobile=%s)", async (mobile) => {
     sidebarState.isMobile = mobile;
     const run = nativeRunningRun();
     const comment = {
@@ -1090,6 +1197,11 @@ describe("TaskChatThread runtime transcript selection", () => {
       currentUserId: "board", issueAssigneeAgentId: "agent-1",
       agentMap: new Map([["agent-1", { id: "agent-1", name: "Runner", adapterType: "paperclip_runner", icon: "code" } as Agent]]),
     };
+    renderThread({ ...props, comments: [] });
+    await act(async () => { editorCallbacks.change(comment.body); });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-send"]')!.click();
+    });
     renderThread({ ...props, comments: [{ ...comment, clientStatus: "pending" }] });
     const identity = container.querySelector('[data-testid="task-chat-agent-identity"]');
     const header = container.querySelector('[data-testid="task-chat-runner-identity-row"]');
@@ -1097,6 +1209,11 @@ describe("TaskChatThread runtime transcript selection", () => {
     expect(identity?.textContent).toBe("Runner");
     expect(identity?.querySelector("svg, img")).not.toBeNull();
     expect(activity?.textContent).toBe("Thinking");
+
+    renderThread(props);
+    expect(container.querySelector('[data-testid="task-chat-agent-identity"]')).toBe(identity);
+    expect(container.querySelector('[data-testid="task-chat-runner-identity-row"]')).toBe(header);
+    expect(container.querySelector('[data-testid="task-chat-current-activity-label"]')).toBe(activity);
 
     for (const startup of [
       { ...run, runtimeMode: undefined, status: "queued", startedAt: null },
@@ -3525,7 +3642,7 @@ describe("TaskChatThread composer alignment", () => {
 
     const dock = container
       .querySelector('[data-testid="mock-editor"]')
-      ?.closest("div.sticky") as HTMLElement | null;
+      ?.closest('[data-testid="task-chat-composer-dock"]') as HTMLElement | null;
 
     expect(dock?.className).toContain("w-full");
     expect(dock?.className).toContain("max-w-(--tc-shell-max-w)");
@@ -4309,26 +4426,22 @@ describe("TaskChatThread Paperclip Runner queue", () => {
   });
 });
 
-describe("TaskChatThread mobile composer dock (PAP-495)", () => {
-  it("pins the composer to the nav-aware bottom offset so its action row clears the auto-hiding bottom nav", () => {
+describe("TaskChatThread mobile composer dock", () => {
+  it("scrolls messages independently of the composer on mobile", () => {
     sidebarState.isMobile = true;
 
     renderThread({
-      comments: [],
+      comments: createLongThreadComments(),
       onAdd: async () => {},
       draftKey: "task-chat-draft:issue-mobile",
     });
 
-    const dock = container
-      .querySelector('[data-testid="mock-editor"]')
-      ?.closest("div.sticky") as HTMLElement | null;
-
+    const dock = container.querySelector('[data-testid="task-chat-composer-dock"]');
+    const scroller = container.querySelector('[data-testid="task-chat-scroller"]');
     expect(dock).not.toBeNull();
-    // Bottom offset comes from --tc-composer-bottom (Layout raises it to the nav
-    // height while the nav is on screen) — NOT the raw safe-area dock, which is
-    // what let the nav occlude the action row before PAP-495.
-    expect(dock?.className).toContain("bottom-(--tc-composer-bottom)");
-    expect(dock?.className).not.toContain("bottom-(--sz-calc-8)");
+    expect(scroller).not.toBeNull();
+    expect(scroller?.textContent).toContain("Thread message 1");
+    expect(scroller?.contains(dock)).toBe(false);
   });
 });
 

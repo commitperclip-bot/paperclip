@@ -1,5 +1,12 @@
 # Runner E2E fixture authoring
 
+[Chat feature evals](CHAT-FEATURES.md) load two authored YAML requests and seed
+only company, agents and project context through public APIs. Both agents use
+production role instructions; evaluator outcomes are never injected. Real browser
+submission, task audits, worker document provenance, completion delivery and
+reload readback establish the outcome. The existing fixture registry, subscription
+credential staging and whole-company cleanup own setup and teardown.
+
 [Deployment-targeted journeys](PRODUCT-JOURNEYS.md) resolve only their requested
 fixture graph through `FixtureRegistry.setupAll(requested)`. Omitting the
 argument preserves the existing all-fixtures behavior. A verified onboarding

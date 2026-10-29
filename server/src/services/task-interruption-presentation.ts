@@ -6,6 +6,7 @@ import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { PROJECT_ACCESS_DENIED } from "./project-access-denial.js";
 import { authorizationService } from "./authorization.js";
+import { taskWorkspaceProjectRequirements } from "./task-workspace-access.js";
 
 type ProjectionIssue = Pick<typeof issues.$inferSelect, "id" | "companyId" | "status" | "assigneeAgentId" | "projectId">;
 type ProjectionRun = Pick<typeof heartbeatRuns.$inferSelect,
@@ -17,6 +18,8 @@ type ProjectionState = {
   wait?: { id: string; requestedAt: Date };
   agent?: Pick<typeof agents.$inferSelect, "status" | "pauseReason">;
   projectAccessAllowed?: boolean;
+  projectAccessProjectId?: string | null;
+  workspaceSelectionAvailable?: boolean;
   project?: Pick<typeof projects.$inferSelect, "pausedAt" | "pauseReason">;
   company?: Pick<typeof companies.$inferSelect, "status" | "pauseReason">;
   paused: boolean;
@@ -30,7 +33,7 @@ function deniedProjectId(issue: ProjectionIssue, run?: ProjectionRun): string | 
       || (run.errorCode !== PROJECT_ACCESS_DENIED && !historical)) return undefined;
   const detail = run.resultJson?.projectAccessDenied;
   return detail && typeof detail === "object" && "projectId" in detail && typeof detail.projectId === "string"
-    ? detail.projectId : historical ? issue.projectId : null;
+    ? detail.projectId : null;
 }
 
 /** Presentation never grants authority. Dispatch repeats all gates under its
@@ -53,8 +56,11 @@ export function projectTaskInterruption(issue: ProjectionIssue, input: Projectio
   const deniedProject = deniedProjectId(issue, run);
   let projectAccess: TaskInterruptionPresentation["projectAccess"];
   if (deniedProject !== undefined) {
+    // Permissions cannot repair a stale or unavailable workspace selection.
+    if (input.workspaceSelectionAvailable === false) return { ...base, state: "failed" };
     const ready = input.projectAccessAllowed === true;
-    projectAccess = { agentId: run.agentId!, projectId: deniedProject === issue.projectId ? deniedProject : null, ready };
+    const projectId = input.projectAccessProjectId === undefined ? deniedProject : input.projectAccessProjectId;
+    projectAccess = { agentId: run.agentId!, projectId: projectId === issue.projectId ? projectId : null, ready };
     if (!ready) return { ...base, responsibility: "user", state: "waiting_for_user",
       userAction: "project_access", projectAccess };
   }
@@ -120,13 +126,17 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   // Recheck current authority, including standard trust, root-issue grants and
   // project policy. Do not reuse the failed run's frozen policy for a new retry.
   // Only denied tasks need these reads; deduplicate projects and batch per agent.
+  // A task's organizational project can differ from its retained source. Old
+  // failures did not record the denied project, and even typed failures can
+  // become obsolete after a workspace selection changes.
+  const deniedIssues = selected.filter(issue => issue.assigneeAgentId && !["done", "cancelled"].includes(issue.status)
+    && deniedProjectId(issue, runMap.get(issue.id)) !== undefined);
+  const requirements = await taskWorkspaceProjectRequirements(db, companyId, deniedIssues.map(issue => issue.id));
   const deniedByAgent = new Map<string, Set<string>>();
-  for (const issue of selected) {
-    const projectId = deniedProjectId(issue, runMap.get(issue.id));
-    if (!projectId || !issue.assigneeAgentId || ["done", "cancelled"].includes(issue.status)) continue;
-    const ids = deniedByAgent.get(issue.assigneeAgentId) ?? new Set<string>();
-    ids.add(projectId);
-    deniedByAgent.set(issue.assigneeAgentId, ids);
+  for (const issue of deniedIssues) {
+    const ids = deniedByAgent.get(issue.assigneeAgentId!) ?? new Set<string>();
+    for (const projectId of requirements.get(issue.id)?.projectIds ?? []) ids.add(projectId);
+    if (ids.size) deniedByAgent.set(issue.assigneeAgentId!, ids);
   }
   const currentAccess = new Map<string, boolean>();
   const authorization = authorizationService(db);
@@ -140,12 +150,18 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   const agentMap = new Map(agentRows.map(agent => [agent.id, agent]));
   const projectMap = new Map(projectRows.map(project => [project.id, project]));
   const pauses = new Set(pauseRows.map(row => row.issueId)), approvalsSet = new Set(approvalRows.map(row => row.issueId));
-  for (const issue of selected) result.set(issue.id, projectTaskInterruption(issue, {
-    run: runMap.get(issue.id), action: actionMap.get(issue.id), wait: waitMap.get(issue.id),
-    projectAccessAllowed: currentAccess.get(`${issue.assigneeAgentId}:${deniedProjectId(issue, runMap.get(issue.id))}`),
-    agent: agentMap.get(issue.assigneeAgentId ?? ""), project: projectMap.get(issue.projectId ?? ""),
-    company: companyRows[0], paused: pauses.has(issue.id), approval: approvalsSet.has(issue.id),
-  }));
+  for (const issue of selected) {
+    const required = requirements.get(issue.id);
+    const denied = required?.projectIds.filter(projectId => currentAccess.get(`${issue.assigneeAgentId}:${projectId}`) !== true);
+    result.set(issue.id, projectTaskInterruption(issue, {
+      run: runMap.get(issue.id), action: actionMap.get(issue.id), wait: waitMap.get(issue.id),
+      projectAccessAllowed: denied?.length === 0,
+      projectAccessProjectId: denied?.includes(issue.projectId ?? "") ? issue.projectId : null,
+      workspaceSelectionAvailable: required?.available ?? false,
+      agent: agentMap.get(issue.assigneeAgentId ?? ""), project: projectMap.get(issue.projectId ?? ""),
+      company: companyRows[0], paused: pauses.has(issue.id), approval: approvalsSet.has(issue.id),
+    }));
+  }
   return result;
 }
 

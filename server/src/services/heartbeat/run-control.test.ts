@@ -429,6 +429,38 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
       .toMatchObject({ status: "done", phase: "done", completedAt: expect.any(Date) });
   });
 
+  it.each(["confirmed", "missing", "wrong_allocation", "unacknowledged", "still_running", "wrong_intent"] as const)("publishes native Stop acknowledgement only after exact remote containment: %s", async proof => {
+    const { company, agent } = await fixture();
+    const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Save work after Stop", assigneeAgentId: agent.id }).returning();
+    const runId = randomUUID(), leaseId = randomUUID(), providerLeaseId = randomUUID();
+    const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId: company.id, agentId: agent.id,
+      nativeIssueId: issue.id, runtimeMode: "native", status: proof === "still_running" ? "running" : "cancelled", finishedAt: proof === "still_running" ? null : new Date(),
+      resultJson: { executionCancellation: { state: "requested", requestedAt: new Date().toISOString() },
+        cancelledByActorType: "user", cancelledByUserId: "operator", nativeCancellation: {
+          schema: "paperclip.native-cancellation.v1", runId: proof === "wrong_intent" ? randomUUID() : runId, companyId: company.id, issueId: issue.id,
+          scope: "run", reasonCode: "cancellation_run_only", dispatchState: proof === "unacknowledged" ? "pending" : "acknowledged", dispatched: true,
+          intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(),
+        }, workspaceRestoreFailure: "restore_failed", workspaceRestoreRecovery: {
+          schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [leaseId],
+        } },
+    }).returning();
+    const receipt = { schema: "paperclip.remote-termination.v1", companyId: company.id, runId, leaseId,
+      provider: "daytona", providerLeaseId: proof === "wrong_allocation" ? randomUUID() : providerLeaseId,
+      state: "stopped", confirmedAt: new Date().toISOString() };
+    await db.insert(environmentLeases).values({ id: leaseId, companyId: company.id, issueId: issue.id, heartbeatRunId: runId,
+      provider: "daytona", providerLeaseId, status: proof === "missing" ? "active" : "released", leasePolicy: "retain_on_failure",
+      releasedAt: proof === "missing" ? null : new Date(), cleanupStatus: proof === "missing" ? null : "success",
+      metadata: proof === "missing" ? {} : { remoteExecutionTermination: receipt } });
+    const control = createHeartbeatRunControl(db, callbacks(db));
+    await control.acknowledgeRemoteStop(run.id, company.id);
+    await control.acknowledgeRemoteStop(run.id, company.id);
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    expect(stopped.resultJson?.executionCancellation).toMatchObject({ state: proof === "confirmed" ? "acknowledged" : "requested" });
+    if (proof === "confirmed") expect(stopped.resultJson?.executionCancellation).toMatchObject({ proof: "provider_termination_receipt" });
+    expect(stopped.resultJson?.workspaceRestoreFailure).toBe("restore_failed");
+    expect(stopped.resultJson?.workspaceRestoreRecovery).toMatchObject({ leaseIds: [leaseId] });
+  });
+
   it("keeps pre-Stop input pending until a later user message authorizes one continuation", async () => {
     const { company, agent } = await fixture();
     const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Retain my direction after Stop",

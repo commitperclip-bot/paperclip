@@ -308,6 +308,7 @@ export function createCloudOAuthCallback(db: Db, dependencies: Dependencies) {
             accessTokenExpiresAt: credentials.accessTokenExpiresAt,
             scopes: credentials.scopes,
             requestedScopes: stateRow.requestedScopes ?? undefined,
+            consentedAt: now().toISOString(),
             tokenType: credentials.tokenType,
             ...(credentials.refreshTokenExpiresAt
               ? { refreshTokenExpiresAt: credentials.refreshTokenExpiresAt }

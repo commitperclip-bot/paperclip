@@ -9,18 +9,19 @@ import * as nativeExecutor from "./native-runtime/native-session-executor.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { recordNativeLocalProcessStop, hasNativeLocalProcessStop, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, eq, sql } from "drizzle-orm";
 import { beforeAll, afterAll, describe, it, expect, vi } from "vitest";
 import {
-  approvals, issueApprovals, issueThreadInteractions, chatConversations, chatEndpoints, toolApplications, toolConnections,
+  applyPendingMigrations, approvals, issueApprovals, issueThreadInteractions, chatConversations, chatEndpoints, toolApplications, toolConnections,
   agentWakeupRequests, agents, companies, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions,
-  issues, nativeRunFinalizations, nativeRunResults, completionContracts, environmentLeases, environments, issueRelations, issueTreeHolds, issueTreeHoldMembers,
+  issues, nativeRunFinalizations, nativeRunResults, completionContracts, environmentLeases, environments, issueRelations, issueTreeHolds, issueTreeHoldMembers, type Db,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase, getEmbeddedPostgresTestSupport } from "../__tests__/helpers/embedded-postgres.js";
+import { resolveExternalTestDatabaseUrl } from "../__tests__/helpers/external-test-database.js";
 import { admitExplicitNativeContinuation } from "./explicit-native-continuation.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "./adapter-execution-control.js";
 import { CONVERSATION_CONTINUATION_POLICY } from "./conversation-continuation.js";
@@ -29,12 +30,19 @@ import { heartbeatService, persistHeartbeatRunProcessMetadata, type HeartbeatEnv
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { createDurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 import { recordNativeFinalizationFailure } from "./native-runtime/native-run-finalizer.js";
-const support = await getEmbeddedPostgresTestSupport();
+const externalUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_CONTINUATION_TEST_DATABASE_URL");
+const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("explicit native conversation continuation", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
-  beforeAll(async () => { database = await startEmbeddedPostgresTestDatabase("explicit-native-message-"); db = createDb(database.connectionString); }, 90_000);
-  afterAll(async () => { await database?.cleanup(); });
+  beforeAll(async () => {
+    if (externalUrl) {
+      await applyPendingMigrations(externalUrl);
+      database = { connectionString: externalUrl, cleanup: async () => {} };
+    } else database = await startEmbeddedPostgresTestDatabase("explicit-native-message-");
+    db = createDb(database.connectionString);
+  }, 90_000);
+  afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
   async function seed() {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
     const sourceRunId = randomUUID(), successorRunId = randomUUID();
@@ -57,6 +65,128 @@ const support = await getEmbeddedPostgresTestSupport();
       actorType: "user", actorId: "board", reason: "issue_commented" };
   }
   type Fixture = Awaited<ReturnType<typeof seed>>;
+  async function readAdmission(f: Fixture, full: boolean) {
+    const reads: Array<Array<Record<string, unknown>>> = [];
+    const recorded = new Proxy(db, { get(target, key) {
+      if (key !== "select") return Reflect.get(target, key);
+      return (...fields: Parameters<Db["select"]>) => {
+        const builder = target.select(...fields), from = builder.from.bind(builder);
+        builder.from = ((...args: Parameters<typeof from>) => {
+          const admissionRead = args[0] === heartbeatRuns && Object.hasOwn(fields[0] ?? {}, "runnerInstanceId");
+          const query = admissionRead && full ? target.select().from(heartbeatRuns) : from(...args);
+          const execute = query.execute.bind(query);
+          if (args[0] === heartbeatRuns) query.execute = async (...executeArgs: Parameters<typeof execute>) => {
+            const rows = await execute(...executeArgs), statement = query.toSQL().sql;
+            if (statement.includes('"id"::text') || statement.endsWith("for update")) reads.push(rows);
+            return rows;
+          };
+          return query;
+        }) as typeof builder.from;
+        return builder;
+      };
+    }});
+    const blocked: string[] = [];
+    const result = await admitExplicitNativeContinuation({ ...f, db: recorded, dryRun: true,
+      onBlocked: reason => blocked.push(reason) });
+    return { result, blocked, reads };
+  }
+  it("keeps admission and the complete locked session profile while omitting prompt data", async () => {
+    const f = await seed();
+    const payload = randomBytes(128 * 1024).toString("base64");
+    const profile = { adapterDispatch: { adapterType: "paperclip_runner", adapterConfig: { instructions: payload } },
+      nativeExecutionInput: { task: { description: payload } }, sessionCheckpoint: { providerSessionId: "retained" },
+      nativeToolContractFingerprint: "retained-fingerprint" };
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, prompt: payload },
+      runnerProfileJson: profile }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    const baseline = await readAdmission(f, true), projected = await readAdmission(f, false);
+    expect(projected.result).toEqual(baseline.result);
+    expect(projected.result).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
+    expect(projected.blocked).toEqual(baseline.blocked);
+    expect(projected.reads).toHaveLength(2);
+    expect(projected.reads.map(rows => rows[0].contextSnapshot)).toEqual([{ issueId: f.issueId }, { issueId: f.issueId }]);
+    expect(projected.reads[0][0].runnerProfileJson).toEqual({ adapterDispatch: { adapterType: "paperclip_runner" } });
+    expect(projected.reads[1][0].runnerProfileJson).toEqual(profile);
+    expect(Buffer.byteLength(JSON.stringify(projected.reads))).toBeLessThan(Buffer.byteLength(JSON.stringify(baseline.reads)) / 2);
+    const [stored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    expect(stored.contextSnapshot).toEqual({ issueId: f.issueId, prompt: payload });
+    expect(stored.runnerProfileJson).toEqual(profile);
+  });
+  it.each([null, [], "scalar", 42, {}, { issueId: 42, wakeCommentId: false, wakeCommentIds: [null, 42],
+    source: null, adapterDispatch: { adapterType: 42 }, nativeWorkspaceSync: [] }].map(value => ({ value })))(
+    "preserves a controller hold with missing or malformed JSON ($value)", async ({ value }) => {
+      const f = await seed();
+      await db.update(heartbeatRuns).set({ contextSnapshot: value as Record<string, unknown> | null,
+        runnerProfileJson: value as Record<string, unknown> | null }).where(eq(heartbeatRuns.id, f.sourceRunId));
+      await db.update(nativeRunFinalizations).set({ leaseOwner: "still-owned" }).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+      const baseline = await readAdmission(f, true), projected = await readAdmission(f, false);
+      expect(projected.result).toEqual(baseline.result);
+      expect(projected.blocked).toEqual(baseline.blocked);
+      expect(projected.blocked).toEqual(["controller_settling"]);
+      expect(projected.reads).toHaveLength(2);
+      expect(projected.reads[1][0].runnerProfileJson).toEqual(baseline.reads[1][0].runnerProfileJson);
+    },
+  );
+  it.each(["new", "saved"])("delivers a reassignment's saved user question once after the native run stopped (%s)", async origin => {
+    const f = await seed();
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, f.issueId));
+    const [source] = await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "issue_reassigned",
+      processPid: null, processGroupId: null,
+    }).where(eq(heartbeatRuns.id, f.sourceRunId)).returning();
+    await db.update(issueRecoveryActions).set({ cause: "native_continuation_requires_reconciliation" })
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    const lease = { id: randomUUID(), companyId: f.companyId, heartbeatRunId: source.id,
+      provider: "daytona", providerLeaseId: "reviewed-task-sandbox" };
+    await db.insert(environmentLeases).values({ ...lease, status: "expired", leasePolicy: "ephemeral",
+      releasedAt: new Date(), cleanupStatus: "success", metadata: {
+        remoteExecutionTermination: remoteTerminationReceipt(lease, { providerLeaseId: lease.providerLeaseId, state: "destroyed" }),
+      },
+    });
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const heartbeat = heartbeatService(db);
+    if (origin === "new") {
+      await heartbeat.wakeup(f.agentId, { source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+        requestedByActorType: "user", requestedByActorId: f.actorId,
+        payload: { issueId: f.issueId, commentId: f.commentId, mutation: "update" },
+        contextSnapshot: { source: "issue.update", issueId: f.issueId, wakeCommentId: f.commentId },
+      });
+    } else {
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+        source: "assignment", triggerDetail: "system", reason: "issue_assigned", status: "deferred_issue_execution",
+        requestedByActorType: "user", requestedByActorId: f.actorId, payload: {
+          issueId: f.issueId, commentId: f.commentId, executionWait: { reason: "execution_recovery" },
+          _paperclipWakeContext: { source: "issue.update", issueId: f.issueId, wakeReason: "issue_assigned",
+            wakeCommentId: f.commentId, wakeCommentIds: [f.commentId] },
+        },
+      });
+    }
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    if (receipt.status === "deferred_issue_execution") {
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date(0) }).where(eq(agentWakeupRequests.id, receipt.id));
+      await Promise.all([heartbeat.resumeExecutionWaitComments(), heartbeat.resumeExecutionWaitComments()]);
+    }
+    const [delivered] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.id));
+    expect(delivered).toMatchObject({ status: origin === "new" ? "queued" : "coalesced", runId: expect.any(String) });
+    const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+      eq(heartbeatRuns.status, "queued")));
+    expect(successors).toHaveLength(1);
+    expect(delivered.runId).toBe(successors[0].id);
+    expect(successors[0]).toMatchObject({ agentId: f.agentId, contextSnapshot: {
+      forceFreshSession: true, previousRunId: source.id, wakeCommentIds: [f.commentId],
+    } });
+    await heartbeat.resumeRemoteStopComments(source);
+    expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+      eq(heartbeatRuns.status, "queued")))).toHaveLength(1);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    const [original] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.id));
+    expect(original).toMatchObject({ status: "cancelled", errorCode: "issue_reassigned" });
+  });
+  it("keeps a bare human assignment behind the execution hold", async () => {
+    const f = await seed();
+    expect(await admitExplicitNativeContinuation({ ...f, db, reason: "issue_assigned", commentId: null })).toBeNull();
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
+    expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+      eq(heartbeatRuns.status, "queued")))).toHaveLength(0);
+  });
   it("automatically admits a saved historical local message once after isolated fallback becomes eligible", async () => {
     const f = await seed();
     const processStartedAt = new Date();
@@ -1451,7 +1581,9 @@ const support = await getEmbeddedPostgresTestSupport();
     { runtime: "native", retry: false }, { runtime: "native", retry: true },
     { runtime: "legacy", retry: false }, { runtime: "legacy", retry: true },
     { runtime: "legacy_startup", retry: false }, { runtime: "legacy_startup", retry: true },
-  ])("resumes a user message after confirmed cleanup: %j", async ({ runtime, retry }) => {
+    { runtime: "native", retry: false, reason: "issue_assigned" },
+    { runtime: "legacy", retry: false, reason: "issue_assigned" },
+  ])("resumes a user message after confirmed cleanup: %j", async ({ runtime, retry, reason = "issue_commented" }) => {
     const f = await seed();
     if (runtime.startsWith("legacy")) {
       await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, f.agentId));
@@ -1474,7 +1606,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const heartbeat = heartbeatService(db, retry ? { environmentRuntime: {
       retryPendingSandboxTeardown: async () => ({ providerLeaseId: identity.providerLeaseId, state: "destroyed" }),
     } as unknown as HeartbeatEnvironmentRuntime } : {});
-    await heartbeat.wakeup(f.agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
+    await heartbeat.wakeup(f.agentId, { source: "automation", triggerDetail: "system", reason,
       requestedByActorType: "user", requestedByActorId: "board", payload: { issueId: f.issueId, commentId: f.commentId },
       contextSnapshot: { issueId: f.issueId, wakeCommentId: f.commentId } });
     const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
@@ -1897,8 +2029,11 @@ const support = await getEmbeddedPostgresTestSupport();
         expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
       } else expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
     });
-  it.each(["live_process", "missing_process", "lease", "coordinator", "successor", "agent_message", "old_comment", "wrong_author", "run_authored", "reassigned", "automatic", "approval", "question", "malformed_comment", "legacy_owner"])("keeps the hold for %s", async kind => {
+  it.each(["issue_commented", "issue_assigned"].flatMap(reason =>
+    ["live_process", "missing_process", "lease", "coordinator", "successor", "agent_message", "system_message", "old_comment", "wrong_author", "run_authored", "reassigned", "automatic", "mention", "approval", "question", "malformed_comment", "missing_comment", "foreign_comment", "legacy_owner"].map(kind => ({ reason, kind })),
+  ))("keeps the hold for $kind ($reason)", async ({ reason, kind }) => {
     const f = await seed();
+    f.reason = reason;
     if (kind === "legacy_owner") await db.insert(heartbeatRuns).values({ companyId: f.companyId,
       agentId: f.agentId, status: "failed", runtimeMode: "legacy", processPid: process.pid,
       contextSnapshot: { issueId: f.issueId }, resultJson: { conversationContinuation: "continue_conversation_v1" } });
@@ -1920,8 +2055,12 @@ const support = await getEmbeddedPostgresTestSupport();
       await db.insert(issueApprovals).values({ companyId: f.companyId, issueId: f.issueId, approvalId });
     }
     if (kind === "malformed_comment") f.commentId = "not-a-uuid";
+    if (kind === "missing_comment") f.commentId = randomUUID();
+    if (kind === "foreign_comment") f.commentId = (await seed()).commentId;
     if (kind === "agent_message") f.actorType = "agent";
+    if (kind === "system_message") f.actorType = "system";
     if (kind === "automatic") f.reason = "issue_continuation_needed";
+    if (kind === "mention") f.reason = "issue_comment_mentioned";
     if (kind === "wrong_author") f.actorId = "someone-else";
     if (kind === "run_authored") await db.update(issueComments).set({ createdByRunId: f.sourceRunId }).where(eq(issueComments.id, f.commentId));
     if (kind === "old_comment") await db.update(issueComments).set({ createdAt: new Date("2026-09-11T09:00:00Z") }).where(eq(issueComments.id, f.commentId));

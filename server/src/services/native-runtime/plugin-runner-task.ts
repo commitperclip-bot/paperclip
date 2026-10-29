@@ -128,7 +128,7 @@ export function createPluginRunnerTaskOwner(input: {
     if (launched || released) throw new Error("Plugin Runner replacement requires a new task lease");
     const native = spec.nativeRunner;
     if (!preparedLaunchId) throw new Error("Plugin Runner launch requires preparation");
-    if (!native || (native.lifecyclePolicy?.mode !== "per_turn" && !(native.lifecyclePolicy?.mode === "warm" && input.harness === "codex" && input.accountIdentity && input.warmTaskVersion === 1))
+    if (!native || (native.lifecyclePolicy?.mode !== "per_turn" && !(native.lifecyclePolicy?.mode === "warm" && input.accountIdentity && input.warmTaskVersion === 1))
       || !preparedIdentity || Object.entries(preparedIdentity).some(([key, value]) => native.identity[key as keyof DurableRecoveryIdentity] !== value)) {
       throw new Error("Plugin Runner requires a structured per-turn native launch");
     }
@@ -295,7 +295,7 @@ export function createPluginRunnerTaskOwner(input: {
   };
   return { launcher, registration, driver, readWorkspaceFile,
     rebind(next: typeof input) {
-      if (!launched || stopRequested || stoppedState || detached || next.harness !== "codex" ||
+      if (!launched || stopRequested || stoppedState || detached || next.harness !== input.harness ||
           input.accountIdentity !== next.accountIdentity || input.credentialIdentity !== next.credentialIdentity ||
           JSON.stringify(input.projectIds) !== JSON.stringify(next.projectIds)) throw new Error("Plugin warm task cannot be rebound");
       input = next;
