@@ -210,7 +210,7 @@ describeEmbeddedPostgres("documentService system issue documents", () => {
     });
   });
 
-  it("rejects the loser of concurrent restores of the same document with a revision conflict", async () => {
+  it("applies concurrent restores of the same document one after another", async () => {
     const { issueId } = await createIssueWithDocuments();
     const original = (await svc.getIssueDocumentByKey(issueId, "plan"))!;
     const revised = await svc.upsertIssueDocument({
@@ -232,12 +232,13 @@ describeEmbeddedPostgres("documentService system issue documents", () => {
       ),
     );
 
-    const rejected = results.filter((result) => result.status === "rejected");
-    for (const result of rejected) {
-      expect(result.reason).toMatchObject({ status: 409 });
-    }
+    expect(results.map((result) => result.status)).toEqual(["fulfilled", "fulfilled", "fulfilled"]);
     const revisions = await svc.listIssueDocumentRevisions(issueId, "plan");
-    expect(revisions).toHaveLength(revised.document.latestRevisionNumber + results.length - rejected.length);
+    expect(revisions).toHaveLength(revised.document.latestRevisionNumber + 3);
+    expect(await svc.getIssueDocumentByKey(issueId, "plan")).toMatchObject({
+      body: original.body,
+      latestRevisionNumber: revised.document.latestRevisionNumber + 3,
+    });
   });
 
   it("locks and unlocks issue documents", async () => {
