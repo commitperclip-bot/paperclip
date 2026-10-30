@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   costEvents,
@@ -1049,27 +1049,34 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     // Make only the audit-event insert fail. The run update commits the
     // terminal status first, so the audit write is best-effort. The sweep must
     // catch the failure and still clear the lock.
-    const transactionSpy = vi
-      .spyOn(db, "transaction")
-      .mockRejectedValueOnce(new Error("simulated audit write failure"));
+    await db.execute(sql`
+      create function reject_stale_lock_audit() returns trigger language plpgsql as $$
+      begin raise exception 'simulated audit write failure'; end;
+      $$
+    `);
 
     try {
+      await db.execute(sql`
+        create trigger reject_stale_lock_audit before insert on heartbeat_run_events
+        for each row execute function reject_stale_lock_audit()
+      `);
       const heartbeat = heartbeatService(db);
       const result = await heartbeat.sweepStaleIssueLocks();
 
       expect(result.terminalizedRunIds).toEqual([runningRunId]);
       expect(result.cleared).toBe(1);
     } finally {
-      transactionSpy.mockRestore();
+      await db.execute(sql`drop trigger if exists reject_stale_lock_audit on heartbeat_run_events`);
+      await db.execute(sql`drop function reject_stale_lock_audit()`);
     }
 
     // The run reached its terminal status even though the audit write failed.
     const runStatus = await db
-      .select({ status: heartbeatRuns.status })
+      .select({ status: heartbeatRuns.status, nextEventSeq: heartbeatRuns.nextEventSeq })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runningRunId))
-      .then((rows) => rows[0]?.status);
-    expect(runStatus).toBe("interrupted");
+      .then((rows) => rows[0]);
+    expect(runStatus).toEqual({ status: "interrupted", nextEventSeq: 1 });
 
     // The sweep cleared the lock in the same pass.
     const lock = await db

@@ -7,6 +7,7 @@ import {
   useEffect,
   useMemo,
   useRef,
+  useState,
   type ReactNode,
 } from "react";
 import {
@@ -33,6 +34,7 @@ import type {
 import type { RunForIssue } from "../api/activity";
 import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
 import type { CompanyUserDirectoryResponse } from "../api/access";
+import type { CaseDetail, IssueCaseLink } from "../api/cases";
 import { issuesApi } from "../api/issues";
 import { authApi } from "../api/auth";
 import type { CompanyListResult } from "../api/companies-query";
@@ -86,6 +88,13 @@ interface LiveEventSubscription {
 const LiveEventSubscriptionContext =
   createContext<LiveEventSubscription | null>(null);
 
+const CompanyLiveConnectionContext = createContext<string | null>(null);
+
+export function useHasCompanyLiveConnection(companyId: string | null | undefined): boolean {
+  const connectedCompanyId = useContext(CompanyLiveConnectionContext);
+  return Boolean(companyId && connectedCompanyId === companyId);
+}
+
 function dispatchLiveEventToSubscribers(
   subscribers: Set<CompanyLiveEventHandler>,
   expectedCompanyId: string,
@@ -123,6 +132,51 @@ export function useCompanyLiveEvent(handler: CompanyLiveEventHandler): void {
       handlerRef.current(event);
     });
   }, [subscription]);
+}
+
+export function useTaskRunLiveUpdates(scope: {
+  companyId: string | null | undefined;
+  issueId: string | null | undefined;
+  issueQueryRef: string;
+  assigneeAgentId: string | null | undefined;
+}): boolean {
+  const connected = useHasCompanyLiveConnection(scope.companyId);
+  const queryClient = useQueryClient();
+  const location = useLocation();
+  const refreshOwner = useRef<{ active: boolean } | null>(null);
+  const refreshRuns = useCallback((coveredByVisibleRoute = false) => {
+    const owner = refreshOwner.current;
+    if (!owner?.active) return;
+    for (const queryKey of [queryKeys.issues.liveRuns(scope.issueQueryRef), queryKeys.issues.activeRun(scope.issueQueryRef)]) {
+      const query = queryClient.getQueryCache().find({ queryKey });
+      if (query?.state.fetchStatus === "fetching") {
+        void (query.promise ?? queryClient.invalidateQueries({ queryKey }, { cancelRefetch: false }))
+          .catch(() => undefined).then(() => {
+            if (owner.active) return queryClient.invalidateQueries({ queryKey }, { cancelRefetch: false });
+          });
+      } else if (!coveredByVisibleRoute) {
+        void queryClient.invalidateQueries({ queryKey }, { cancelRefetch: false });
+      }
+    }
+  }, [queryClient, scope.issueQueryRef]);
+  useEffect(() => {
+    const owner = { active: true };
+    refreshOwner.current = owner;
+    if (connected && scope.issueId && scope.assigneeAgentId) refreshRuns();
+    return () => { owner.active = false; };
+  }, [connected, refreshRuns, scope.companyId, scope.issueId, scope.assigneeAgentId]);
+  useCompanyLiveEvent((event) => {
+    if (event.companyId !== scope.companyId || !scope.issueId ||
+      (event.type !== "heartbeat.run.queued" && event.type !== "heartbeat.run.status")) return;
+    const issueId = readString(event.payload.issueId);
+    const matches = issueId
+      ? issueId === scope.issueId || issueId === scope.issueQueryRef
+      : true;
+    if (!matches) return;
+    const visible = resolveVisibleIssueRouteContext(queryClient, location.pathname);
+    refreshRuns(Boolean(visible?.issueRefs.has(scope.issueQueryRef) && runEventMatchesVisibleIssue(visible, event.payload)));
+  });
+  return connected && Boolean(scope.issueId && scope.assigneeAgentId);
 }
 
 function readString(value: unknown): string | null {
@@ -475,6 +529,13 @@ function shouldSuppressRunStatusToastForVisibleIssue(
   );
 }
 
+function runEventMatchesVisibleIssue(context: VisibleIssueRouteContext, payload: Record<string, unknown>): boolean {
+  const runId = readString(payload.runId);
+  const agentId = readString(payload.agentId);
+  return (runId !== null && context.runIds.has(runId)) ||
+    Boolean(agentId && context.assigneeAgentId && agentId === context.assigneeAgentId);
+}
+
 function invalidateVisibleIssueRunQueries(
   queryClient: QueryClient,
   pathname: string,
@@ -489,13 +550,7 @@ function invalidateVisibleIssueRunQueries(
   if (!context) return false;
 
   const runId = readString(payload.runId);
-  const agentId = readString(payload.agentId);
-  const matchesVisibleIssue =
-    (runId !== null && context.runIds.has(runId)) ||
-    (!!agentId &&
-      !!context.assigneeAgentId &&
-      agentId === context.assigneeAgentId);
-  if (!matchesVisibleIssue) return false;
+  if (!runEventMatchesVisibleIssue(context, payload)) return false;
 
   const status = readString(payload.status);
   if (runId && status && TERMINAL_RUN_STATUSES.has(status)) {
@@ -858,6 +913,11 @@ const ISSUE_DOCUMENT_ACTIVITY_ACTIONS = new Set([
   "issue.document_updated",
   "issue.document_restored",
   "issue.document_deleted",
+]);
+const ISSUE_CASE_WORK_ACTIVITY_ACTIONS = new Set([
+  "issue.updated",
+  "issue.checked_out",
+  "issue.released",
 ]);
 const ISSUE_DOCUMENT_ANNOTATION_ACTIVITY_ACTIONS = new Set([
   "issue.document_annotation_thread_created",
@@ -1233,6 +1293,7 @@ function invalidateHeartbeatQueries(
   companyId: string,
   payload: Record<string, unknown>,
 ) {
+  queryClient.invalidateQueries({ queryKey: queryKeys.issues.summaries(companyId) });
   // Note: liveRuns(companyId) is intentionally NOT invalidated here — it is
   // event-sourced via applyRunLifecycleToCompanyLiveRuns in the caller.
   queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(companyId) });
@@ -1370,6 +1431,28 @@ function invalidateActivityQueries(
         entityId,
         details,
       );
+      const taskDocumentsChanged = !!action && ISSUE_DOCUMENT_ACTIVITY_ACTIONS.has(action);
+      const caseWorkChanged = !!action && ISSUE_CASE_WORK_ACTIVITY_ACTIONS.has(action);
+      if (caseWorkChanged) {
+        // A changed task can bring a case into a filtered list that did not
+        // contain it, even when no case detail has been loaded yet.
+        queryClient.invalidateQueries({ queryKey: queryKeys.cases.list(companyId) });
+      }
+      if (taskDocumentsChanged || caseWorkChanged) {
+        const changedTaskRefs = new Set(issueRefs);
+        // Both detail aliases embed primary-task state. Linked tasks affect the
+        // document rollup, including creation of their first document.
+        queryClient.invalidateQueries({
+          queryKey: ["cases", "detail"],
+          predicate: (query) => {
+            const cached = query.state.data as CaseDetail | undefined;
+            return cached?.companyId === companyId && (
+              changedTaskRefs.has(cached.workIssueId ?? "") ||
+              (taskDocumentsChanged && cached.issueLinks?.some((link) => changedTaskRefs.has(link.issueId)) === true)
+            );
+          },
+        });
+      }
       const visibleContext = options?.pathname
         ? resolveVisibleIssueRouteContext(queryClient, options.pathname, {
             isForegrounded: options.isForegrounded,
@@ -1584,12 +1667,52 @@ function invalidateActivityQueries(
       queryKey: queryKeys.cases.list(companyId),
     });
     if (entityId) {
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.cases.detail(entityId),
-      });
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.cases.events(entityId),
-      });
+      const caseRefs = new Set([entityId]);
+      const issueRefs = new Set<string>();
+      const handoffIssueId = action?.startsWith("case.handoff_")
+        ? readString(payload.issueId) ?? readString(details?.issueId)
+        : null;
+      if (handoffIssueId) issueRefs.add(handoffIssueId);
+      // Detail routes normally use the identifier, while activity carries the UUID.
+      for (const [key, cached] of queryClient.getQueriesData<{ id: string; identifier?: string; workIssueId?: string | null }>({
+        queryKey: ["cases", "detail"],
+      })) {
+        if (cached?.id !== entityId) continue;
+        queryClient.invalidateQueries({ queryKey: key });
+        if (cached.identifier) caseRefs.add(cached.identifier);
+        if (cached.workIssueId) issueRefs.add(cached.workIssueId);
+      }
+      // A task's cases panel can be mounted without ever loading case detail.
+      for (const [key, links] of queryClient.getQueriesData<IssueCaseLink[]>({
+        queryKey: ["cases", "for-issue"],
+      })) {
+        const link = links?.find((candidate) => candidate.case.id === entityId);
+        if (!link) continue;
+        queryClient.invalidateQueries({ queryKey: key });
+        caseRefs.add(link.case.identifier);
+      }
+      const documentChanged = action !== null && [
+        "case.document_revised", "case.document_created", "case.document_updated",
+        "case.document_restored", "case.document_deleted",
+      ].includes(action);
+      const documentKey = readString(details?.key) ?? readString(details?.documentKey);
+      for (const ref of caseRefs) {
+        queryClient.invalidateQueries({ queryKey: queryKeys.cases.detail(ref) });
+        queryClient.invalidateQueries({ queryKey: queryKeys.cases.events(ref) });
+        queryClient.invalidateQueries({ queryKey: queryKeys.cases.handoffs(ref) });
+        if (documentChanged) {
+          queryClient.invalidateQueries({ queryKey: queryKeys.cases.documents(ref) });
+          queryClient.invalidateQueries({
+            queryKey: documentKey ? ["cases", "document", ref, documentKey] : ["cases", "document", ref],
+          });
+          queryClient.invalidateQueries({
+            queryKey: documentKey ? queryKeys.cases.revisions(ref, documentKey) : ["cases", "revisions", ref],
+          });
+        }
+      }
+      for (const ref of issueRefs) {
+        queryClient.invalidateQueries({ queryKey: queryKeys.cases.forIssue(ref) });
+      }
       if (action && CASE_DOCUMENT_ANNOTATION_ACTIVITY_ACTIONS.has(action)) {
         const documentKey =
           readString(details?.key) ?? readString(details?.documentKey);
@@ -1722,14 +1845,14 @@ function handleLiveEvent(
     event.createdAt,
     event.type,
   );
-  if (liveStatusPatch) {
-    applyRunLiveStatusPatchToCaches(
-      queryClient,
-      expectedCompanyId,
-      pathname,
-      liveStatusPatch,
-    );
-  }
+  const liveStatusPatched = liveStatusPatch
+    ? applyRunLiveStatusPatchToCaches(
+        queryClient,
+        expectedCompanyId,
+        pathname,
+        liveStatusPatch,
+      )
+    : false;
   if (event.type === "heartbeat.run.log") {
     return;
   }
@@ -1762,7 +1885,7 @@ function handleLiveEvent(
 
   if (event.type === "heartbeat.run.progress") {
     invalidateHeartbeatProgressQueries(queryClient, expectedCompanyId, payload);
-    invalidateVisibleIssueRunQueries(queryClient, pathname, payload);
+    if (!liveStatusPatched) invalidateVisibleIssueRunQueries(queryClient, pathname, payload);
     return;
   }
 
@@ -1873,6 +1996,7 @@ export const __liveUpdatesTestUtils = {
   buildRunStatusToast,
   closeSocketQuietly,
   dispatchLiveEventToSubscribers,
+  handleLiveEvent,
   LiveEventSubscriptionContext,
   applyRunLiveStatusPatchToCaches,
   hydrateVisibleIssueComment,
@@ -1897,6 +2021,8 @@ function canUseLiveSession(sessionStatus: string, hasSession: boolean, deploymen
 export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
   const { visible } = usePageVisibility();
   const wasHidden = useRef(!visible);
+  const hasOpenedSocket = useRef(false);
+  const hasNeededSocketRecovery = useRef(!visible);
   const { selectedCompanyId, selectedCompany } = useCompany();
   const queryClient = useQueryClient();
   const { pushToast } = useToastActions();
@@ -1916,7 +2042,9 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
   const currentUserId = session?.user?.id ?? session?.session?.userId ??
     (health?.deploymentMode === "local_trusted" ? "local-board" : null);
   const socketAuthKey = session?.session?.id ?? currentUserId ?? "signed_out";
+  const [connectedScopeKey, setConnectedScopeKey] = useState<string | null>(null);
   const liveCompanyId = resolveLiveCompanyId(selectedCompanyId, selectedCompany?.id ?? null);
+  const socketScopeKey = JSON.stringify([liveCompanyId, socketAuthKey]);
   const canConnectSocket = canUseLiveSession(sessionStatus, session != null, health?.deploymentMode) && liveCompanyId !== null;
   const currentActorRef = useRef<{ userId: string | null; agentId: string | null }>({
     userId: currentUserId,
@@ -1961,6 +2089,7 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!visible) {
       wasHidden.current = true;
+      hasNeededSocketRecovery.current = true;
       invalidationBatcher.dispose();
       return;
     }
@@ -2002,6 +2131,7 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
     const scheduleReconnect = () => {
       if (closed || reconnectTimer !== null) return;
       reconnectAttempt += 1;
+      hasNeededSocketRecovery.current = true;
       const delayMs = Math.min(
         15000,
         1000 * 2 ** Math.min(reconnectAttempt - 1, 4),
@@ -2030,13 +2160,22 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
           closeSocketQuietly(nextSocket, "stale_connection");
           return;
         }
+        setConnectedScopeKey(socketScopeKey);
         stopPolling();
         if (reconnectAttempt > 0) {
           gateRef.current.suppressUntil = Date.now() + RECONNECT_SUPPRESS_MS;
         }
         // The initial page queries can finish before the first subscription,
         // too. Reconcile that gap as well as reconnects: events are not replayed.
-        void queryClient.invalidateQueries({ type: "active" }, { cancelRefetch: false });
+        const initialHealthyOpen = !hasOpenedSocket.current && !hasNeededSocketRecovery.current;
+        hasOpenedSocket.current = true;
+        void queryClient.invalidateQueries({
+          type: "active",
+          ...(initialHealthyOpen ? { predicate: (query) => {
+            const key = JSON.stringify(query.queryKey);
+            return key !== JSON.stringify(queryKeys.auth.session) && key !== JSON.stringify(queryKeys.health);
+          } } : {}),
+        }, { cancelRefetch: false });
         reconnectAttempt = 0;
       };
 
@@ -2073,6 +2212,8 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
       };
 
       nextSocket.onerror = () => {
+        if (closed || socket !== nextSocket) return;
+        setConnectedScopeKey((current) => current === socketScopeKey ? null : current);
         // Wait for onclose to drive the reconnect. Self-closing here is what
         // produces the "closed before connection established" browser noise.
       };
@@ -2081,6 +2222,7 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
         if (socket !== nextSocket) return;
         socket = null;
         if (closed) return;
+        setConnectedScopeKey((current) => current === socketScopeKey ? null : current);
         startPolling();
         scheduleReconnect();
       };
@@ -2093,6 +2235,7 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
 
     return () => {
       closed = true;
+      setConnectedScopeKey((current) => current === socketScopeKey ? null : current);
       window.clearTimeout(connectTimer);
       clearReconnect();
       stopPolling();
@@ -2109,11 +2252,16 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
     pushToast,
     canConnectSocket,
     socketAuthKey,
+    socketScopeKey,
   ]);
 
   return (
-    <LiveEventSubscriptionContext.Provider value={subscriptionValue}>
-      {children}
-    </LiveEventSubscriptionContext.Provider>
+    <CompanyLiveConnectionContext.Provider value={
+      visible && canConnectSocket && connectedScopeKey === socketScopeKey ? liveCompanyId : null
+    }>
+      <LiveEventSubscriptionContext.Provider value={subscriptionValue}>
+        {children}
+      </LiveEventSubscriptionContext.Provider>
+    </CompanyLiveConnectionContext.Provider>
   );
 }

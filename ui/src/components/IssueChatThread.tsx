@@ -1,8 +1,10 @@
 import { resolveIssueChatHumanAuthor } from "@/lib/issue-chat-human-author";
-import { useWorkspaceBaseRefRecovery } from "./WorkspaceBaseRefRecovery";
+import { useCurrentWorkspaceRetry, useWorkspaceBaseRefRecovery, useWorkspaceRetry } from "./WorkspaceBaseRefRecovery";
 import { WorkspaceBaseRefRecoveryNotice } from "./WorkspaceBaseRefRecoveryNotice";
 import { DispositionRecoveryNotice, useDispositionRecoverySnapshot } from "./DispositionRecoveryNotice";
 import { AgentAvatar } from "@/components/AgentAvatar";
+import { TaskChatRunnerTurn } from "./task-chat/TaskChatRunnerTurn";
+import { useRunnerSubmission } from "@/hooks/useRunnerSubmission";
 import type { ComposerRunSettings } from "./task-chat/composer-run-settings";
 import { ComposerRunSettingsPicker } from "./task-chat/ComposerRunSettingsPicker";
 import { ComposerAddMenu, ComposerModeChip } from "./task-chat/ComposerAddMenu";
@@ -541,6 +543,9 @@ interface IssueChatComposerProps {
 }
 
 interface IssueChatThreadProps {
+  executionBlocked?: boolean;
+  interruption?: import("@paperclipai/shared").TaskInterruptionPresentation | null;
+  retryPreparing?: boolean;
   /** Browser sessions are placed chronologically by the default task thread. */
   browsers?: import("@paperclipai/shared").TaskBrowser[];
   onOpenBrowser?: (browserId: string) => void;
@@ -796,14 +801,16 @@ class IssueChatErrorBoundary extends Component<
 
 export function IssueAssigneePausedNotice({
   agent,
+  issueStatus,
   onResume,
   resuming,
 }: {
   agent: Agent | null;
+  issueStatus: string | undefined;
   onResume?: () => Promise<void> | void;
   resuming?: boolean;
 }) {
-  if (!agent || agent.status !== "paused") return null;
+  if (!agent || agent.status !== "paused" || issueStatusIsTerminalDisposition(issueStatus)) return null;
 
   const pauseDetail =
     agent.pauseReason === "budget"
@@ -3500,6 +3507,7 @@ function SystemNoticeCommentContent({
     : null;
   const recoverySnapshot = useDispositionRecoverySnapshot(commentMetadata);
   const branchRecovery = useWorkspaceBaseRefRecovery(commentMetadata);
+  const workspaceRetry = useWorkspaceRetry(commentMetadata);
   const runAgentId =
     typeof custom.runAgentId === "string" ? custom.runAgentId : null;
   const runId = typeof custom.runId === "string" ? custom.runId : null;
@@ -3596,6 +3604,7 @@ function SystemNoticeCommentContent({
       });
   };
 
+  if (authorType === "system" && workspaceRetry) return null;
   if (authorType === "system" && branchRecovery) return <div id={anchorId}><WorkspaceBaseRefRecoveryNotice key={`${branchRecovery.actionId}:${branchRecovery.runId}`} {...branchRecovery.props} /></div>;
 
   if (authorType === "system" && recoverySnapshot) {
@@ -5766,6 +5775,8 @@ export function IssueChatThread({
   successfulRunHandoff = null,
   scheduledRetry = null,
   recoveryAction = null,
+  interruption,
+  retryPreparing = false,
   onResolveRecoveryAction,
   onReissueIsolatedRecoveryAction,
   reissueIsolatedRecoveryActionPending = false,
@@ -5847,6 +5858,7 @@ export function IssueChatThread({
   externalReferences,
   linkCaseReferences = false,
 }: IssueChatThreadProps) {
+  const workspaceRetry = useCurrentWorkspaceRetry();
   const location = useLocation();
   const lastScrolledHashRef = useRef<string | null>(null);
   const didInitialHashScrollDecisionRef = useRef(false);
@@ -6086,14 +6098,39 @@ export function IssueChatThread({
     return true;
   }
 
+  const {
+    pending: submissionPending,
+    takingLonger: submissionTakingLonger,
+    begin: beginSubmission,
+    reject: rejectSubmission,
+    blocked: startupBlocked,
+  } = useRunnerSubmission({
+    issueId,
+    agentId: issueAssigneeAgentId,
+    agent: agentMap?.get(issueAssigneeAgentId ?? ""),
+    blocked: Boolean(composerPause),
+    comments,
+    issueStatus,
+    runId: displayLiveRuns[0]?.id ?? null,
+    linkedRuns,
+    interruption,
+    onRefresh: onRefreshLatestComments,
+  });
   const sendComposerComment = useCallback<IssueChatThreadProps["onAdd"]>(
-    (body, reopen, reassignment, attachmentIds, clientRequestId, runSettings) => {
+    async (body, reopen, reassignment, attachmentIds, clientRequestId, runSettings) => {
       pendingSubmitScrollRef.current = true;
-      return runSettings
-        ? onAdd(body, reopen, reassignment, attachmentIds, clientRequestId, runSettings)
-        : onAdd(body, reopen, reassignment, attachmentIds, clientRequestId);
+      clientRequestId ??= crypto.randomUUID();
+      const attempt = beginSubmission(clientRequestId);
+      try {
+        await (runSettings
+          ? onAdd(body, reopen, reassignment, attachmentIds, clientRequestId, runSettings)
+          : onAdd(body, reopen, reassignment, attachmentIds, clientRequestId));
+      } catch (error) {
+        rejectSubmission(attempt, error);
+        throw error;
+      }
     },
-    [onAdd],
+    [onAdd, beginSubmission, rejectSubmission],
   );
   const runtime = usePaperclipIssueRuntime({
     messages,
@@ -6622,6 +6659,12 @@ export function IssueChatThread({
                     />
                   ))
                 )}
+                {!isRunning && !startupBlocked && issueAssigneeAgentId && (submissionPending || retryPreparing || interruption?.state === "working") ? (
+                  <TaskChatRunnerTurn items={[]} status="queued" startedAtMs={null}
+                    agent={agentMap?.get(issueAssigneeAgentId)}
+                    agentName={agentMap?.get(issueAssigneeAgentId)?.name}
+                    preparationLabel={submissionTakingLonger ? "Taking longer than usual…" : undefined} />
+                ) : null}
                 {showComposer ? (
                   <div
                     data-testid="issue-chat-thread-notices"
@@ -6634,7 +6677,7 @@ export function IssueChatThread({
                       onResume={onResumeFromBacklog}
                       resuming={resumeFromBacklogPending}
                     />
-                    {recoveryAction ? (
+                    {recoveryAction && !workspaceRetry ? (
                       <IssueRecoveryActionCard
                         action={recoveryAction}
                         agentMap={agentMap}
@@ -6706,6 +6749,7 @@ export function IssueChatThread({
                     />
                     <IssueAssigneePausedNotice
                       agent={assignedAgent}
+                      issueStatus={issueStatus}
                       onResume={onResumeAssignee}
                       resuming={resumeAssigneePending}
                     />
@@ -6718,6 +6762,7 @@ export function IssueChatThread({
                   >
                     <IssueAssigneePausedNotice
                       agent={assignedAgent}
+                      issueStatus={issueStatus}
                       onResume={onResumeAssignee}
                       resuming={resumeAssigneePending}
                     />

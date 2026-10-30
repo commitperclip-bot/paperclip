@@ -11,6 +11,7 @@ const EVENT_POLL_INTERVAL_MS = 2_000;
 export interface NativeRunTranscriptSource {
   id: string;
   status: string;
+  conversationOnly?: boolean;
   runtimeMode?: "legacy" | "native";
 }
 
@@ -26,7 +27,7 @@ function isLive(status: string): boolean {
 export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource[]) {
   const nativeRunsKey = runs
     .filter((run) => run.runtimeMode === "native")
-    .map((run) => `${run.id}:${run.status}`)
+    .map((run) => `${run.id}:${run.status}:${Boolean(run.conversationOnly)}`)
     .sort()
     .join(",");
   const nativeRuns = useMemo(
@@ -38,12 +39,19 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
   const [eventsByRun, setEventsByRun] = useState<Map<string, HeartbeatRunEvent[]>>(new Map());
   const [errorsByRun, setErrorsByRun] = useState<Map<string, NativeRunTranscriptError>>(new Map());
   const [hydratedRunIds, setHydratedRunIds] = useState<ReadonlySet<string>>(new Set());
+  const [hydratedStatusByRun, setHydratedStatusByRun] = useState(new Map<string, string>());
   const [retryGeneration, setRetryGeneration] = useState(0);
   const retry = useCallback(() => setRetryGeneration((value) => value + 1), []);
   const projectionCacheRef = useRef(new Map<string, { events: HeartbeatRunEvent[]; transcript: TranscriptEntry[] }>());
   const cursorByRunRef = useRef(new Map<string, number>());
+  const conversationOnlyByRunRef = useRef(new Map<string, boolean>());
 
   useEffect(() => {
+    for (const run of nativeRuns) {
+      const mode = Boolean(run.conversationOnly);
+      if (conversationOnlyByRunRef.current.get(run.id) !== mode) cursorByRunRef.current.delete(run.id);
+      conversationOnlyByRunRef.current.set(run.id, mode);
+    }
     let cancelled = false;
     const controller = new AbortController();
     const timers = new Set<number>();
@@ -54,6 +62,7 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
     };
     setEventsByRun(retainMap);
     setErrorsByRun(retainMap);
+    setHydratedStatusByRun(retainMap);
     setHydratedRunIds((previous) => {
       const next = new Set([...previous].filter((id) => retainedIds.has(id)));
       return next.size === previous.size ? previous : next;
@@ -69,7 +78,7 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
         const incoming: HeartbeatRunEvent[] = [];
         for (;;) {
           const page = await readTranscriptRequest(
-            (signal) => heartbeatsApi.events(run.id, cursor, EVENT_PAGE_SIZE, { signal }),
+            (signal) => (run.conversationOnly ? heartbeatsApi.conversationEvents : heartbeatsApi.events)(run.id, cursor, EVENT_PAGE_SIZE, { signal }),
             controller.signal,
           );
           if (cancelled) return;
@@ -87,7 +96,7 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
         cursorByRunRef.current.set(run.id, cursor);
         if (incoming.length > 0) setEventsByRun((previous) => {
           const next = new Map(previous);
-          next.set(run.id, [...(previous.get(run.id) ?? []), ...incoming]);
+          next.set(run.id, [...new Map([...(previous.get(run.id) ?? []), ...incoming].map((event) => [event.seq, event])).values()].sort((a, b) => a.seq - b.seq));
           return next;
         });
         setErrorsByRun((previous) => {
@@ -95,6 +104,10 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
           const next = new Map(previous);
           next.delete(run.id);
           return next;
+        });
+        setHydratedStatusByRun((previous) => {
+          if (previous.get(run.id) === run.status) return previous;
+          return new Map(previous).set(run.id, run.status);
         });
       } catch (error) {
         if (cancelled) return;
@@ -145,8 +158,12 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
     return transcripts;
   }, [eventsByRun, nativeRuns]);
 
+  const terminalHydratedRunIds = useMemo(() => new Set(nativeRuns
+    .filter((run) => !isLive(run.status) && hydratedStatusByRun.get(run.id) === run.status)
+    .map((run) => run.id)), [nativeRuns, hydratedStatusByRun]);
+
   return {
-    transcriptByRun, errorsByRun, hydratedRunIds, retry,
+    transcriptByRun, errorsByRun, hydratedRunIds, terminalHydratedRunIds, retry,
     isInitialHydrating: nativeRuns.some((run) => !hydratedRunIds.has(run.id)),
   };
 }

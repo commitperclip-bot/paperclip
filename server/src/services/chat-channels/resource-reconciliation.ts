@@ -1,3 +1,4 @@
+import type { ConnectionManagementContext } from "../connection-management.js";
 import { imessageResourceParticipants } from "./imessage-photon/resources.js";
 import { createGitHubResources, reconcileGitHubRepositoryCoordinates } from "./github/resources.js";
 import { baseTeamsConversationId } from "./microsoft-teams/resources.js";
@@ -166,7 +167,7 @@ export function createChatResourceReconciliation(db: Db, options: ResourceReconc
     endpointId: string,
     updates: Array<{ id: string; enabled?: boolean; executionDefaults?: ChatExecutionDefaults | null }>,
     actorUserId?: string | null,
-    options?: { initialGitHubImport?: boolean },
+    options?: { initialGitHubImport?: boolean; managementContext?: ConnectionManagementContext },
   ) {
     await updateResourceSelection(endpointId, updates, actorUserId, options);
     return listResources(endpointId);
@@ -176,8 +177,9 @@ export function createChatResourceReconciliation(db: Db, options: ResourceReconc
     endpointId: string,
     updates: Array<{ id: string; enabled?: boolean; executionDefaults?: ChatExecutionDefaults | null }>,
     actorUserId?: string | null,
-    options?: { initialGitHubImport?: boolean; allGitHubRepositoriesEnabled?: boolean },
+    options?: { initialGitHubImport?: boolean; allGitHubRepositoriesEnabled?: boolean; managementContext?: ConnectionManagementContext },
   ) {
+    await options?.managementContext?.reauthorize();
     const initial = await endpointRecord(endpointId);
     if (!initial) throw notFound("Chat endpoint not found");
     const bulk = options?.allGitHubRepositoriesEnabled !== undefined;
@@ -263,7 +265,7 @@ export function createChatResourceReconciliation(db: Db, options: ResourceReconc
             await assertChatExecutionDefaultsAccess(db, {
               companyId: endpoint.companyId,
               assigneeAgentId: endpoint.assignedAgentId,
-              actor: { type: "board", userId: actorUserId, source: actorUserId ? "session" : "local_implicit" },
+              actor: options?.managementContext?.actor ?? { type: "board", userId: actorUserId, source: actorUserId ? "session" : "local_implicit" },
               defaults: entry.executionDefaults,
             }, tx);
             finalDefaults.set(entry.id, entry.executionDefaults);
@@ -306,8 +308,7 @@ export function createChatResourceReconciliation(db: Db, options: ResourceReconc
               tx as unknown as Db,
               {
                 companyId: endpoint.companyId,
-                actorType: "user",
-                actorId: actorUserId ?? "board",
+                ...(options?.managementContext?.audit ?? { actorType: "user" as const, actorId: actorUserId ?? "board" }),
                 action: "chat_endpoint.resources_updated",
                 entityType: "tool_connection",
                 entityId: endpoint.connectionId,

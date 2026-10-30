@@ -1,7 +1,9 @@
+import type { WorkspaceWorkers } from "../plugin-workspaces.js";
 import { recoverLegacyUnsafeWorkspaceExports } from "./native-workspace-export-recovery.js";
 import { hasPendingNativeChildCompletion } from "./native-child-completion-delivery.js";
 import { dismissAutomaticCompletionReviews, decisionHasRetiredAutomaticReview } from "./automatic-completion-reviews.js";
 import { logger } from "../../middleware/logger.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -35,7 +37,7 @@ import {
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueService } from "../issues.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
-import { reportRunFailure } from "../run-failure-report.js";
+import { isNewTerminalRunFailure, reportRunFailure } from "../run-failure-report.js";
 import { resumeNativeWorkspaceFinalization } from "./native-workspace-finalizer.js";
 import { dismissObsoleteNativePolicyReviews } from "./obsolete-policy-reviews.js";
 import {
@@ -489,6 +491,7 @@ export async function claimNativeSessionResumptions(input: {
         || (!!checkpoint && !checkpointHasProviderIdentity)
       ) {
         const failureCode = originalFailureCode;
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.accounting, row.run.companyId);
         await tx.update(nativeRunFinalizations).set({
           phase: "terminal_failure",
           leaseOwner: null,
@@ -519,9 +522,10 @@ export async function claimNativeSessionResumptions(input: {
         }).where(eq(heartbeatRuns.id, row.run.id)).returning();
         // Only a genuine transition into "failed" is a new terminal failure.
         // A candidate that is already "failed" (the filter above admits
-        // both "running" and "failed") must not send a second Sentry event.
+        // both "running" and "failed") must not send a second Sentry event,
+        // unless that earlier write was an unreported pending retry.
         terminalRunToEmit =
-          updatedRun && updatedRun.status !== row.run.status ? updatedRun : null;
+          updatedRun && isNewTerminalRunFailure(row.run, updatedRun) ? updatedRun : null;
         await issueService(tx as unknown as Db).update(
           row.coordinator.issueId,
           { status: "blocked" },
@@ -623,6 +627,7 @@ export async function claimNativeSessionResumptions(input: {
 }
 
 type NativeReconciliationOptions = {
+  pluginWorkerManager?: WorkspaceWorkers;
   environmentRuntime?: EnvironmentRuntimeService;
   onWorkspaceSettled?: (input: {
     runId: string;
@@ -634,20 +639,11 @@ type NativeReconciliationOptions = {
 
 type NativeReconciliationPassTiming = ReturnType<typeof createNativeReconciliationPassTiming>;
 
-// A committed finalization whose run ended this long ago, with no undelivered
-// decision effect, is settled: its result is projected and its effects are
-// delivered, so an unscoped pass has nothing to finish. Re-reading every such
-// row on every pass cost dozens of sequential queries per row, and startup
-// runs the pass twice before readiness. Recent rows stay in every pass, so the
-// crash-window repairs still run promptly.
 export const NATIVE_SETTLED_COMMITTED_GRACE_MS = 60 * 60 * 1000;
-// Settled rows still get the presentation and evidence upkeep, a few per pass
-// in a rotating order, so a late repair is delayed, never skipped.
 export const NATIVE_SETTLED_COMMITTED_UPKEEP_PER_PASS = 10;
 const NATIVE_SETTLED_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"];
 let settledCommittedUpkeepCursor: string | null = null;
 
-/** Test hook: restart the settled-row upkeep rotation from the beginning. */
 export function resetSettledCommittedUpkeepForTests() {
   settledCommittedUpkeepCursor = null;
 }
@@ -668,7 +664,6 @@ function settledCommittedFinalization(now: Date): SQL {
   )!;
 }
 
-/** The next settled committed runs in the upkeep rotation, wrapping at the end. */
 async function nextSettledCommittedUpkeep(db: Db, now: Date): Promise<string[]> {
   const page = (after: string | null) => db
     .select({ runId: heartbeatRuns.id })
@@ -732,8 +727,6 @@ async function reconcileNativeFinalizationsPass(
   }
   timing.phase("candidate_scan");
   const now = new Date();
-  // An unscoped pass skips settled committed rows, except the few in this
-  // pass's upkeep rotation. A scoped pass reconciles exactly the given runs.
   const unscoped = !(runIds && runIds.length > 0);
   const upkeepRunIds = unscoped ? await nextSettledCommittedUpkeep(db, now) : [];
   const rows = await db
@@ -749,8 +742,8 @@ async function reconcileNativeFinalizationsPass(
       resultId: nativeRunFinalizations.resultId,
       assessmentId: nativeRunFinalizations.assessmentId,
       decisionId: nativeRunFinalizations.decisionId,
-      runnerProfileJson: heartbeatRuns.runnerProfileJson,
-      contextSnapshot: heartbeatRuns.contextSnapshot,
+      nativeWorkspaceSync: sql<unknown>`${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync'`,
+      nativeStatusWakeIntentId: sql<unknown>`${heartbeatRuns.contextSnapshot}->'nativeStatusWakeIntentId'`,
     })
     .from(heartbeatRuns)
     .innerJoin(nativeRunFinalizations, eq(nativeRunFinalizations.runId, heartbeatRuns.id))
@@ -962,8 +955,7 @@ async function reconcileNativeFinalizationsPass(
         if (reviewBarrier && reviewBarrier.status !== "succeeded") continue;
         const childCompletionRecipient = {
           companyId: row.companyId, issueId: row.issueId, agentId: row.agentId, runId: row.runId,
-          sourceIntentId: typeof record(row.contextSnapshot).nativeStatusWakeIntentId === "string"
-            ? record(row.contextSnapshot).nativeStatusWakeIntentId as string : null,
+          sourceIntentId: typeof row.nativeStatusWakeIntentId === "string" ? row.nativeStatusWakeIntentId : null,
         };
         const hasPendingChildCompletion = await hasPendingNativeChildCompletion(db, childCompletionRecipient);
         const reassessmentRow = await recordNativeWorkAssessment({
@@ -1051,6 +1043,7 @@ async function reconcileNativeFinalizationsPass(
         db,
         runId: row.runId,
         environmentRuntime: options.environmentRuntime,
+        pluginWorkerManager: options.pluginWorkerManager,
       });
       // Busy is ownership, not another failed export or retry-budget debit.
       if (!operation) continue;
@@ -1060,11 +1053,13 @@ async function reconcileNativeFinalizationsPass(
         const unrecoverable = operation.stderrExcerpt?.includes(
           "workspace_sync_out_unrecoverable",
         );
+        const pluginFailure = operation.stderrExcerpt?.trim();
+        const pluginRepair = pluginFailure === "plugin_workspace_branch_mismatch" || pluginFailure === "plugin_workspace_owner_mismatch";
         const failure = await recordNativeFinalizationFailure({
           db,
           runId: row.runId,
           error: new Error(
-            unrecoverable
+            pluginRepair ? `native_${pluginFailure}` : unrecoverable
               ? "native_workspace_sync_out_unrecoverable"
               : "native_workspace_sync_out_failed",
           ),
@@ -1099,7 +1094,7 @@ async function reconcileNativeFinalizationsPass(
           projectRunStatus: true,
           preserveProviderAttempt: Boolean(
             readNativeWorkspaceSyncReference(
-              record(row.runnerProfileJson).nativeWorkspaceSync,
+              row.nativeWorkspaceSync,
             ),
           ),
         });
@@ -1157,7 +1152,7 @@ async function reconcileNativeFinalizationsPass(
         projectRunStatus: true,
         preserveProviderAttempt: Boolean(
           readNativeWorkspaceSyncReference(
-            record(row.runnerProfileJson).nativeWorkspaceSync,
+            row.nativeWorkspaceSync,
           ),
         ),
       });

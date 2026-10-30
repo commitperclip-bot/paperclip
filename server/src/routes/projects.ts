@@ -1,8 +1,11 @@
+import { projectGitAuthorizationService } from "../services/project-git-authorization.js";
 import { skillAccessRequestContext } from "../services/skill-access.js";
 import { createHash } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { activityLog } from "@paperclipai/db";
 import { projectToolContext } from "../services/project-tool-context.js";
+import { museExternalAgents, withExternalExecutionAdmission } from "../modules/external-agents/index.js";
+import { parseNativeExecutionInput } from "../vendor/paperclip-runner/index.js";
 import { persistActivity, publishActivity } from "../services/activity-log.js";
 import { z } from "zod";
 import { normalizeProjectRepositoryUrl, resolveProjectRepositorySelection } from "../services/project-repositories.js";
@@ -294,6 +297,22 @@ export function projectRoutes(db: Db) {
     res.json(await toolAccessService(db).listProjectRepositories(companyId, viewer.userId, viewer.localTrusted));
   });
 
+  router.get("/projects/:id/git-authorization", async (req, res) => {
+    assertBoard(req);
+    const project = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Project not found");
+    if (!project || !(await assertProjectReadAllowed(req, res, project))) return;
+    if (!req.actor.userId) throw forbidden("A signed-in user is required");
+    res.json(await projectGitAuthorizationService(db).read(project.companyId, project.id, req.actor.userId));
+  });
+
+  router.put("/projects/:id/git-authorization", validate(z.object({ grantId: z.string().uuid().nullable() }).strict()), async (req, res) => {
+    assertBoard(req);
+    const project = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Project not found");
+    if (!project || !(await assertProjectReadAllowed(req, res, project)) || !(await assertProjectWorkspaceWriteAllowed(req, res, project))) return;
+    if (!req.actor.userId) throw forbidden("A signed-in user is required");
+    res.json(await projectGitAuthorizationService(db).set(project.companyId, project.id, req.actor.userId, req.body.grantId));
+  });
+
   router.put("/projects/:id/repositories", validate(z.object({ repositoryIds: z.array(z.string().regex(/^\d+$/)) })), async (req, res) => {
     assertBoard(req);
     const project = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Project not found");
@@ -396,6 +415,31 @@ export function projectRoutes(db: Db) {
     const result = await db.transaction(async (tx) => {
       if (receiptKey) {
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${receiptKey}, 0))`);
+      }
+      const museActor = runContext && req.actor.type === "agent" && req.actor.authorizingUserId ? req.actor : null;
+      if (museActor) {
+        const { companyId: actorCompanyId, agentId, runId, authorizingUserId } = museActor;
+        if (!actorCompanyId || !agentId || !runId) throw forbidden("Muse native tool authority is unavailable");
+        // The receipt lock can wait too. Keep current authority behind every
+        // admission wait and ahead of both receipt replay and project creation.
+        await withExternalExecutionAdmission(tx, actorCompanyId, agentId, runId, async () => {
+          const current = await projectToolContext(tx as unknown as Db, museActor, true, "Project", { includeExecutionInput: true });
+          try {
+            const execution = parseNativeExecutionInput(current.run.runnerProfileJson?.nativeExecutionInput);
+            const broker = museExternalAgents(db);
+            if (current.run.runtimeMode !== "native" || execution.schema !== "paperclip.native-execution-input.v8"
+              || execution.binding.companyId !== actorCompanyId || execution.binding.agentId !== agentId
+              || execution.binding.runId !== runId || execution.binding.issueId !== current.issue.id
+              || await broker.authorizingUserIdForBinding(execution.provider.binding) !== authorizingUserId) {
+              throw new Error("Muse internal tool authority mismatch");
+            }
+            await broker.assertRunAuthority(execution, tx as unknown as Db);
+          } catch {
+            throw forbidden("Muse native tool authority is unavailable");
+          }
+        });
+      }
+      if (receiptKey) {
         const [prior] = await tx.select().from(activityLog).where(and(
           eq(activityLog.companyId, companyId), eq(activityLog.action, "project.created"),
           sql`${activityLog.details}->>'idempotencyKey' = ${receiptKey}`,
@@ -407,7 +451,7 @@ export function projectRoutes(db: Db) {
           return { project, publication: null, duplicate: true };
         }
       }
-      if (runContext) await projectToolContext(tx as unknown as Db, req.actor, true);
+      if (runContext && !museActor) await projectToolContext(tx as unknown as Db, req.actor, true);
       const service = projectService(tx as unknown as Db);
       const project = repositories ? await service.createWithRepositories(companyId, projectData, repositories) : await service.create(companyId, projectData);
       if (project.visibility === "private") await addActorAsPrivateProjectPrincipal(req, project, tx as unknown as Db);

@@ -35,6 +35,8 @@ import { safeChatTaskUrl } from "./chat-task-url.js";
 import { hasChatRunOwnedProviderInteraction } from "./chat-interaction-arbitration.js";
 import { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON } from "./heartbeat-run-summary.js";
 import { resolveChatOriginPublicationBindings } from "./issues.js";
+import { boundRunIssueIdSql } from "./run-task-binding.js";
+import { chatRunMilestoneSource } from "./chat-run-milestone-candidates.js";
 import { authorizeNativeChatReviewPresentation } from "./native-runtime/native-chat-review-presentation.js";
 import {
   SAFE_NATIVE_CHAT_PROGRESS_EVENT_TYPES,
@@ -130,14 +132,18 @@ export async function resolveChatRunPresentationAuthorizationReason(
 /** A missing receipt is not proof that a provider write never arrived. */
 export async function githubRunReplyState(
   db: Db,
-  input: { companyId: string; issueId: string; runId: string; endpointId: string },
+  input: { companyId: string; issueId: string; runId: string; endpointId: string; sourceCommentId?: string; requireSettled?: boolean },
 ): Promise<"none" | "unsettled" | "confirmed"> {
   const actions = await db
     .select({
       status: chatActions.status,
       operation: sql<string>`${chatActions.payload}->>'operation'`,
       reviewId: sql<string | null>`${chatActions.payload}->>'reviewId'`,
-      result: chatActions.result,
+      result: sql<Record<string, unknown> | null>`case when ${chatActions.result} is null then null else jsonb_build_object(
+        'reviewId', ${chatActions.result}->'reviewId', 'id', ${chatActions.result}->'id', 'url', ${chatActions.result}->'url', 'summaryUrl', ${chatActions.result}->'summaryUrl',
+        'replyWriteStarted', ${chatActions.result}->'replyWriteStarted', 'retryable', ${chatActions.result}->'retryable',
+        'code', ${chatActions.result}->'code', 'attempts', ${chatActions.result}->'attempts',
+        'deliveryUnknown', ${chatActions.result}->'deliveryUnknown') end`,
     })
     .from(chatActions)
     .innerJoin(chatConversations, and(
@@ -160,12 +166,19 @@ export async function githubRunReplyState(
       sql`${chatActions.payload}->'session'->>'issueId' = ${input.issueId}`,
       sql`${chatActions.payload}->'session'->>'runId' = ${input.runId}`,
       sql`${chatActions.payload}->>'operation' in ('comment', 'formal_review', 'assessment')`,
+      input.sourceCommentId ? sql`exists (select 1 from chat_message_links source_link
+        where source_link.company_id = ${chatActions.companyId} and source_link.endpoint_id = ${chatActions.endpointId}
+          and source_link.conversation_id = ${chatActions.conversationId} and source_link.delivery_id = ${chatActions.deliveryId}
+          and source_link.direction = 'inbound' and source_link.comment_id = ${input.sourceCommentId}::uuid)` : undefined,
     ));
-  let unsettled = false;
+  let unsettled = false, confirmed = false;
   for (const action of actions) {
+    if (input.requireSettled && (action.status !== "processed" || action.result?.deliveryUnknown === true)) {
+      unsettled = true;
+    }
     // An assessment can publish findings before a later step fails or loses
     // authority. Those durable receipts still prove a reply was delivered.
-    if (action.operation === "assessment") {
+    if (action.operation === "assessment" && !input.requireSettled) {
       const [review] = await db
         .select({ receipts: chatGitHubReviews.publicationReceipts })
         .from(chatGitHubReviews)
@@ -180,11 +193,16 @@ export async function githubRunReplyState(
     }
     if (action.status === "processed") {
       if (action.operation === "comment" || action.operation === "formal_review") {
-        if (action.result?.id && action.result?.url) return "confirmed";
-        unsettled = true;
+        if (action.result?.id && action.result?.url) {
+          if (!input.requireSettled) return "confirmed";
+          confirmed = true;
+        } else unsettled = true;
       }
       if (action.operation === "assessment") {
-        if (action.result?.summaryUrl) return "confirmed";
+        if (action.result?.summaryUrl) {
+          if (!input.requireSettled) return "confirmed";
+          confirmed = true;
+        } else if (input.requireSettled) unsettled = true;
       }
     } else if (action.result?.replyWriteStarted === true || ["received", "processing"].includes(action.status) ||
       (action.status === "failed" && (action.result?.retryable === true || action.result?.code === "publication_failed")) ||
@@ -193,7 +211,7 @@ export async function githubRunReplyState(
       unsettled = true;
     }
   }
-  return unsettled ? "unsettled" : "none";
+  return unsettled ? "unsettled" : confirmed ? "confirmed" : "none";
 }
 
 type ChatRunMilestoneCandidate = {
@@ -250,13 +268,13 @@ export function safeMilestoneText(input: {
 }): string {
   if (input.milestone === "queued") return `${input.agentName} is queued.`;
   if (input.milestone === "working") return `${input.agentName} is working…`;
-  if (input.milestone === "completed")
-    return `${input.agentName} completed this turn.`;
   if (input.errorCode === "slack_session_stopped")
     return `${input.agentName} stopped at your request.`;
   const taskUrl = safeChatTaskUrl(input.publicBaseUrl, input.issueId);
   const recovery =
-    input.milestone === "waiting_for_input"
+    input.milestone === "completed"
+      ? `${input.agentName} has no final response to show yet.`
+      : input.milestone === "waiting_for_input"
       ? `${input.agentName} needs a Paperclip admin to safely recover this turn before more work can start.`
       : input.errorCode === "low_trust_isolation_unavailable"
         ? `${input.agentName} couldn't safely start this turn because this task was started for an unlinked external guest and isolated guest execution isn't available. Ask a Paperclip admin to create a private identity link for this account or enable isolated guest execution, then start a new task.`
@@ -291,7 +309,7 @@ async function enqueueSafeNativeChatProgress(
     heartbeatRunEvents,
     "safe_native_progress_later_event",
   );
-  const issueIdFromContext = sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`;
+  const issueIdFromContext = boundRunIssueIdSql();
   let inserted = 0;
   let cursor: {
     eventCreatedAt: Date;
@@ -331,7 +349,7 @@ async function enqueueSafeNativeChatProgress(
         chatConversations,
         and(
           eq(chatConversations.companyId, heartbeatRuns.companyId),
-          sql`${issueIdFromContext} = ${chatConversations.issueId}::text`,
+          sql`coalesce(${heartbeatRuns.issueId}::text, ${issueIdFromContext}) = ${chatConversations.issueId}::text`,
           inArray(chatConversations.state, ["active", "waiting"]),
         ),
       )
@@ -667,7 +685,7 @@ export async function enqueueChatRunMilestones(
 ): Promise<number> {
   const since = input.since ?? new Date(Date.now() - 24 * 60 * 60_000);
   const limit = Math.max(1, Math.min(input.limit ?? 200, 1_000));
-  const issueIdFromContext = sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`;
+  const issueIdFromContext = boundRunIssueIdSql();
   const explicitlyAuthoredCommentReason = sql<boolean>`(
     ${issueComments.metadata} ->> 'authorizationReason' = 'paperclip_runner_protocol'
     or left(coalesce(${issueComments.metadata} ->> 'authorizationReason', ''), 6) = 'allow_'
@@ -715,12 +733,17 @@ export async function enqueueChatRunMilestones(
       and continuation_wake.run_id = ${heartbeatRuns.id}
       and continuation_wake.agent_id = ${heartbeatRuns.agentId}
       and continuation_wake.status <> 'skipped'
-      and continuation_wake.idempotency_key = case
+      and (
+        (interaction.kind = 'request_item_verdicts'
+          and continuation_wake.payload->>'interactionId' = interaction.id::text
+          and continuation_wake.payload->>'sourceRunId' = interaction.source_run_id::text
+          and continuation_wake.reason = 'issue_commented')
+        or continuation_wake.idempotency_key = case
         when interaction.kind = 'ask_user_questions'
           and interaction.status = 'answered'
           then 'question-response:' || interaction.id::text
         else 'interaction:' || interaction.id::text || ':' || interaction.status
-      end
+      end)
     where interaction.company_id = ${heartbeatRuns.companyId}
       and interaction.issue_id::text = ${issueIdFromContext}
       and interaction.id::text = ${heartbeatRuns.contextSnapshot} ->> 'interactionId'
@@ -731,10 +754,52 @@ export async function enqueueChatRunMilestones(
           and interaction.status in ('answered', 'cancelled')
         )
         or (
-          interaction.kind = 'request_confirmation'
+          interaction.kind in ('request_confirmation', 'request_checkbox_confirmation', 'suggest_tasks')
           and interaction.status in ('accepted', 'rejected', 'cancelled')
         )
+        or (
+          interaction.kind = 'request_item_verdicts'
+          and interaction.status in ('pending', 'answered', 'cancelled')
+        )
       )
+  )`;
+  const hasConnectionContinuation = sql<boolean>`(
+    ${heartbeatRuns.contextSnapshot}->>'source' = 'connection_intent.resolved' and exists (
+      select 1 from connection_intent_deliveries delivery
+      inner join issue_thread_interactions interaction on interaction.id = delivery.interaction_id
+        and interaction.company_id = delivery.company_id
+      inner join agent_wakeup_requests wake on wake.company_id = delivery.company_id
+        and wake.run_id = ${heartbeatRuns.id} and wake.agent_id = ${heartbeatRuns.agentId}
+        and wake.idempotency_key = 'connection-intent:' || interaction.id::text || ':' || interaction.status
+        and wake.status <> 'skipped'
+      where delivery.company_id = ${heartbeatRuns.companyId}
+        and interaction.issue_id::text = ${issueIdFromContext}
+        and interaction.id::text = ${heartbeatRuns.contextSnapshot}->>'interactionId'
+    )
+  )`;
+  const hasMonitorContinuation = sql<boolean>`(
+    ${heartbeatRuns.contextSnapshot}->>'source' = 'issue.monitor' and exists (
+      select 1 from agent_wakeup_requests monitor_wake
+      where monitor_wake.company_id = ${heartbeatRuns.companyId}
+        and monitor_wake.run_id = ${heartbeatRuns.id}
+        and monitor_wake.agent_id = ${heartbeatRuns.agentId}
+        and monitor_wake.reason = 'issue_monitor_due'
+        and monitor_wake.status <> 'skipped'
+        and monitor_wake.payload->>'issueId' = ${issueIdFromContext}
+    )
+  )`;
+  // This is only a candidate prefilter. The origin resolver below requires the
+  // committed decision/effect ledger before selecting any conversation.
+  const hasTaskContinuation = sql<boolean>`(
+    ${heartbeatRuns.contextSnapshot}->>'source' = 'native_status_decision' and exists (
+      select 1 from agent_wakeup_requests continuation_wake
+      where continuation_wake.company_id = ${heartbeatRuns.companyId}
+        and continuation_wake.run_id = ${heartbeatRuns.id}
+        and continuation_wake.agent_id = ${heartbeatRuns.agentId}
+        and continuation_wake.reason = 'issue_status_changed'
+        and continuation_wake.status in ('queued', 'claimed', 'completed', 'coalesced')
+        and continuation_wake.payload->>'issueId' = ${issueIdFromContext}
+    )
   )`;
   let inserted = 0;
   let cursor: {
@@ -762,7 +827,7 @@ export async function enqueueChatRunMilestones(
         conversationId: chatConversations.id,
         agentName: agents.name,
       })
-      .from(heartbeatRuns)
+      .from(chatRunMilestoneSource(since))
       .innerJoin(
         chatConversations,
         and(
@@ -814,6 +879,7 @@ export async function enqueueChatRunMilestones(
                   "issue.interaction.respond",
                   "issue.interaction.accept",
                   "issue.interaction.reject",
+                  "issue.interaction.verdicts",
                   "issue.interaction.cancel",
                   "issue.interaction.withdraw",
                   "external_chat.interaction.resolve",
@@ -822,6 +888,9 @@ export async function enqueueChatRunMilestones(
               hasDirectInteractionContinuation,
             ),
             hasQuestionContinuationTarget,
+            hasConnectionContinuation,
+            hasMonitorContinuation,
+            hasTaskContinuation,
           ),
           // Heartbeat marks a run succeeded before the presentation resolver
           // finishes. Waiting for its durable decision prevents a generic
@@ -830,6 +899,11 @@ export async function enqueueChatRunMilestones(
             ${heartbeatRuns.status} <> 'succeeded'
             or ${heartbeatRuns.resultJson} -> 'presentationDecision' is not null
           )`,
+          sql`(${heartbeatRuns.status} <> 'succeeded' or coalesce(
+            ${heartbeatRuns.resultJson}->'nativeResult'->>'reportedWorkDisposition',
+            ${heartbeatRuns.resultJson}->'acceptedResult'->>'reportedWorkDisposition',
+            ${heartbeatRuns.resultJson}->'semanticResult'->'result'->>'reportedWorkDisposition', ''
+          ) <> 'yielded')`,
           // A successful or interrupted run's selected final remains its
           // authoritative response. Filter it before LIMIT so a page of settled
           // runs cannot starve later milestones.
@@ -865,6 +939,9 @@ export async function enqueueChatRunMilestones(
             ),
           ),
           or(
+            hasConnectionContinuation,
+            hasMonitorContinuation,
+            hasTaskContinuation,
             sql`exists (
               select 1
               from ${chatMessageLinks}
