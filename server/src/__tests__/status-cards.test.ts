@@ -749,6 +749,32 @@ describeEmbeddedPostgres("status card routes", () => {
     expect(await db.select().from(issues)).toHaveLength(1);
   });
 
+  it("cancels the in-flight generation task when an edited prompt supersedes it", async () => {
+    const company = await seedCompany();
+    await enableStatusCards();
+    await seedSummarizer(company.id);
+    const app = createApp(db, localBoardActor());
+    const created = await request(app)
+      .post(`/api/companies/${company.id}/status-cards`)
+      .send({ interestPrompt: "Blocked launch tasks" });
+    const cardId = created.body.id as string;
+    const firstIssueId = created.body.generatingIssueId as string;
+    await issueService(db).update(firstIssueId, { status: "in_progress" });
+
+    const patched = await request(app)
+      .patch(`/api/status-cards/${cardId}`)
+      .send({ interestPrompt: "Overdue launch tasks" });
+    expect(patched.status).toBe(200);
+
+    const card = await statusCardService(db).getById(cardId);
+    expect(card?.generatingIssueId).toBeTruthy();
+    expect(card?.generatingIssueId).not.toBe(firstIssueId);
+    const [first] = await db.select().from(issues).where(eq(issues.id, firstIssueId));
+    expect(first?.status).toBe("cancelled");
+    const [second] = await db.select().from(issues).where(eq(issues.id, card!.generatingIssueId!));
+    expect(second?.status).not.toBe("cancelled");
+  });
+
   it("re-offers and re-kicks Run now when a setup task stalls as blocked", async () => {
     // Regression: a compile task that the Summarizer *blocks* (stuck awaiting a
     // human, e.g. after the refresh 500 it never finished) left the card wedged —

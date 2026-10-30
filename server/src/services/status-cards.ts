@@ -419,6 +419,12 @@ export function statusCardService(
       .set({ generatingIssueId: generationIssue!.id, state: "compiling", failureReason: null, updatedAt: createdAt })
       .where(eq(statusCards.id, card.id))
       .returning();
+    if (card.generatingIssueId && card.generatingIssueId !== generationIssue!.id) {
+      const displaced = await db.select().from(issues).where(eq(issues.id, card.generatingIssueId)).then((rows) => rows[0] ?? null);
+      if (displaced && !TERMINAL_ISSUE_STATUSES.has(displaced.status)) {
+        await issuesSvc.update(displaced.id, { status: "cancelled" });
+      }
+    }
     return {
       card: nextCard!,
       generatingIssue: generationIssue!,
