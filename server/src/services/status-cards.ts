@@ -385,7 +385,7 @@ export function statusCardService(
       // never finish on its own, so a manual re-kick must supersede it (reopened
       // to `todo` below) rather than silently no-op.
       if (active && !TERMINAL_ISSUE_STATUSES.has(active.status) && active.status !== "blocked" && payload?.promptHash === hash) {
-        return { card, generatingIssue: active, alreadyGenerating: true };
+        return { card, generatingIssue: active, alreadyGenerating: true, displacedRunId: null };
       }
     }
 
@@ -419,9 +419,11 @@ export function statusCardService(
       .set({ generatingIssueId: generationIssue!.id, state: "compiling", failureReason: null, updatedAt: createdAt })
       .where(eq(statusCards.id, card.id))
       .returning();
+    let displacedRunId: string | null = null;
     if (card.generatingIssueId && card.generatingIssueId !== generationIssue!.id) {
       const displaced = await db.select().from(issues).where(eq(issues.id, card.generatingIssueId)).then((rows) => rows[0] ?? null);
       if (displaced && !TERMINAL_ISSUE_STATUSES.has(displaced.status)) {
+        displacedRunId = displaced.executionRunId;
         await issuesSvc.update(displaced.id, { status: "cancelled" });
       }
     }
@@ -432,6 +434,7 @@ export function statusCardService(
       // deduplicated `blocked` task was just revived (reopened to todo) above, so
       // that is a fresh re-kick, not a no-op.
       alreadyGenerating: deduplicated && !TERMINAL_ISSUE_STATUSES.has(created.status) && created.status !== "blocked",
+      displacedRunId,
     };
   }
 

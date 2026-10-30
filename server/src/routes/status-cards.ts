@@ -10,13 +10,17 @@ import {
   writeStatusCardSummarySchema,
 } from "@paperclipai/shared";
 import { forbidden, notFound, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import { validate } from "../middleware/validate.js";
 import { authorizationDeniedDetails, issueReadSqlCondition } from "../services/authorization.js";
 import { accessService, heartbeatService, instanceSettingsService, issueService, logActivity, statusCardService } from "../services/index.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "../services/issue-assignment-wakeup.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 
-export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWakeupDeps } = {}) {
+export function statusCardRoutes(
+  db: Db,
+  opts: { heartbeat?: IssueAssignmentWakeupDeps & Pick<ReturnType<typeof heartbeatService>, "cancelRun"> } = {},
+) {
   const router = Router();
   const access = accessService(db);
   const settings = instanceSettingsService(db);
@@ -83,10 +87,17 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
 
   async function enqueueCompile(req: Request, cardId: string) {
     const actor = getActorInfo(req);
-    const result = await service.requestCompile(cardId, {
+    const { displacedRunId, ...result } = await service.requestCompile(cardId, {
       agentId: actor.actorType === "agent" ? actor.actorId : null,
       userId: actor.actorType === "user" ? actor.actorId : null,
     });
+    if (displacedRunId) {
+      try {
+        await heartbeat.cancelRun(displacedRunId, "Superseded by a newer status-card compile");
+      } catch (err) {
+        logger.warn({ err, runId: displacedRunId, cardId }, "failed to cancel superseded status-card compile run");
+      }
+    }
     if (!result.alreadyGenerating) {
       try {
         await queueIssueAssignmentWakeup({

@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, companies, createDb, issues } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { statusCardRoutes } from "../routes/status-cards.js";
 import { withBuiltInAgentMarker } from "../lib/built-in-agent-metadata.js";
@@ -28,10 +28,10 @@ describeEmbeddedPostgres("status card compile supersede", () => {
     await tempDb?.cleanup();
   });
 
-  it("cancels the in-flight compile task when a prompt edit supersedes it", async () => {
+  it("cancels the in-flight compile task and stops its run when a prompt edit supersedes it", async () => {
     const company = await db.insert(companies).values({ name: "Co", issuePrefix: `SC${randomUUID().slice(0, 6).toUpperCase()}` }).returning().then((rows) => rows[0]!);
     await instanceSettingsService(db).updateExperimental({ enableStatusCards: true });
-    await db.insert(agents).values({
+    const summarizer = await db.insert(agents).values({
       companyId: company.id,
       name: "Summarizer",
       role: "general",
@@ -39,24 +39,36 @@ describeEmbeddedPostgres("status card compile supersede", () => {
       adapterType: "codex_local",
       adapterConfig: { model: "gpt-5.4" },
       metadata: withBuiltInAgentMarker(null, { key: "summarizer", featureKeys: ["summarizer"] }),
-    });
+    }).returning().then((rows) => rows[0]!);
+    const cancelledRunIds: string[] = [];
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
       req.actor = { type: "board", userId: "board-user", source: "local_implicit", isInstanceAdmin: true };
       next();
     });
-    app.use("/api", statusCardRoutes(db, { heartbeat: { wakeup: async () => ({ queued: true }) } }));
+    app.use("/api", statusCardRoutes(db, {
+      heartbeat: {
+        wakeup: async () => ({ queued: true }),
+        cancelRun: async (runId: string) => {
+          cancelledRunIds.push(runId);
+          return null;
+        },
+      },
+    }));
     app.use(errorHandler);
     const created = await request(app).post(`/api/companies/${company.id}/status-cards`).send({ interestPrompt: "Blocked launch tasks" });
     const displacedIssueId = created.body.generatingIssueId as string;
+    const run = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: summarizer.id, status: "running" }).returning().then((rows) => rows[0]!);
     await issueService(db).update(displacedIssueId, { status: "in_progress" });
+    await db.update(issues).set({ checkoutRunId: run.id, executionRunId: run.id }).where(eq(issues.id, displacedIssueId));
 
     const patched = await request(app).patch(`/api/status-cards/${created.body.id}`).send({ interestPrompt: "Done launch tasks" });
 
     expect(patched.status).toBe(200);
     expect(patched.body).toMatchObject({ state: "compiling", failureReason: null });
     expect(patched.body.generatingIssueId).not.toBe(displacedIssueId);
+    expect(cancelledRunIds).toEqual([run.id]);
     expect(await db.select().from(issues).where(eq(issues.id, displacedIssueId)).then((rows) => rows[0]?.status)).toBe("cancelled");
     expect(await db.select().from(issues).where(eq(issues.id, patched.body.generatingIssueId)).then((rows) => rows[0]?.status)).toBe("todo");
   });
