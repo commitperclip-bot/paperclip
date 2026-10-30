@@ -1,3 +1,4 @@
+import { connectionActorUserId } from "../actor.js";
 import { vercelConnectHttpError, vercelCredentialFor, vercelConnectResourcesFor } from "../vercel-credentials.js";
 import type { ActorInfo } from "../types.js";
 import { connectionMethodForConnection, projectedConnectionHeaders } from "../connection-methods.js";
@@ -174,9 +175,7 @@ export function createVercelOAuthCallback(db: Db, dependencies: Dependencies) {
         subjectUserId: stateRow.subjectUserId,
         ...grantValues,
         createdByUserId:
-          input.actor?.actorType === "user"
-            ? (input.actor.actorId ?? null)
-            : null,
+          connectionActorUserId(input.actor),
       });
     }
     const preActivationLifecycle = {

@@ -816,7 +816,8 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
 
   it("preserves live descendants and pending reopening", async () => {
     const f = await fixture();
-    await db.insert(issues).values({ companyId: f.companyId, title: "Active child", status: "in_progress", parentId: f.issueId });
+    await db.insert(issues).values({ companyId: f.companyId, title: "Active child", status: "in_progress", parentId: f.issueId,
+      executionWorkspaceId: f.workspaceId, executionWorkspacePreference: "reuse_existing" });
     expect((await f.expire()).expired).toBe(false);
     await db.delete(issues).where(eq(issues.parentId, f.issueId));
     const row = await f.row();
@@ -830,7 +831,7 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
     await fs.writeFile(path.join(f.cwd, ".git"), `gitdir: ${path.join(f.cwd, "missing-admin")}\n`);
     const result = await f.expire();
     expect(result).toMatchObject({ expired: false, skipReason: "inspection_failed",
-      failure: { name: "Error", code: expect.any(String), at: expect.stringMatching(/^at /), stderr: expect.stringContaining("not a git repository") } });
+      failure: { name: "Error", code: expect.any(String), at: expect.stringMatching(/^at /), stderr: expect.stringMatching(/not a git repository|gitfile does not point to a valid repository/) } });
     expect(await exists(f.cwd)).toBe(true);
   });
 

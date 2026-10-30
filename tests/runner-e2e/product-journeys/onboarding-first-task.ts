@@ -6,6 +6,7 @@ import { activeRuns, firstTaskCompletionSettled, type Row } from "../first-task-
 import { isBlockedUnstartedWake, isTerminalUnstartedWake } from "../non-execution-wake.js";
 import { JourneyError, type JourneyContext, type OnboardingArtifactEvidence, type TargetSession } from "./types.js";
 import { retainOnboardingArtifact } from "./artifact-evidence.js";
+import { preAcceptanceTaskStatus, preAcceptanceViolations, type OnboardingPreAcceptanceEvidence } from "./onboarding-pre-acceptance.js";
 
 export interface OnboardingFirstTaskInput {
   context: JourneyContext;
@@ -18,6 +19,7 @@ export interface OnboardingFirstTaskInput {
   own: TargetSession["own"];
   observeRun(run: Row): Promise<void>;
   onArtifact?(artifact: OnboardingArtifactEvidence): void;
+  onPreAcceptanceFailure?(evidence: OnboardingPreAcceptanceEvidence): void;
 }
 export interface OnboardingFirstTaskResult {
   runIds: string[];
@@ -91,9 +93,19 @@ export async function onboardingFirstTask(input: OnboardingFirstTaskInput): Prom
       fail("onboarding_first_task_failed");
     }
   };
-  const assertBeforeAcceptance = (snapshot: Snapshot, parentId: string) => {
-    if (snapshot.tasks.length !== 1 || snapshot.tasks[0]!.id !== parentId || snapshot.attachments.length ||
-      snapshot.documents.some(document => !isPlanningDocument(document)) || snapshot.tasks[0]!.status === "done") fail("onboarding_work_before_acceptance");
+  const assertBeforeAcceptance = (snapshot: Snapshot, parentId: string, checkpoint: OnboardingPreAcceptanceEvidence["checkpoint"]) => {
+    const observed = {
+      taskCount: snapshot.tasks.length, attachmentCount: snapshot.attachments.length,
+      documentCount: snapshot.documents.length, nonPlanningDocumentCount: snapshot.documents.filter(document => !isPlanningDocument(document)).length,
+      firstTaskMatchesCanonicalParent: snapshot.tasks[0]?.id === parentId,
+      firstTaskStatus: preAcceptanceTaskStatus(snapshot.tasks[0]),
+      canonicalParentStatus: preAcceptanceTaskStatus(snapshot.tasks.find(task => task.id === parentId)),
+    };
+    const violations = preAcceptanceViolations(observed);
+    if (violations.length) {
+      input.onPreAcceptanceFailure?.({ version: 1, checkpoint, violations, ...observed });
+      fail("onboarding_work_before_acceptance");
+    }
     assertRuns(snapshot, [parentId]);
   };
 
@@ -105,7 +117,7 @@ export async function onboardingFirstTask(input: OnboardingFirstTaskInput): Prom
   await input.own({ kind: "issue", name: parent.title, id: parent.id });
   snapshot = await load(parent.id);
   if (seen.size) fail("onboarding_opening_started_model_work");
-  assertBeforeAcceptance(snapshot, parent.id);
+  assertBeforeAcceptance(snapshot, parent.id, "before-opening-answer");
   const opening = snapshot.interactions.filter(row => row.kind === "ask_user_questions" && row.status === "pending");
   const questions = opening[0]?.payload?.questionSet?.questions ?? opening[0]?.payload?.questions ?? [];
   const question = questions.find((row: Row) => row.id === "first-task-opening");
@@ -129,7 +141,7 @@ export async function onboardingFirstTask(input: OnboardingFirstTaskInput): Prom
   let proposal: Row | undefined;
   while (!proposal) {
     snapshot = await load(parent.id);
-    assertBeforeAcceptance(snapshot, parent.id);
+    assertBeforeAcceptance(snapshot, parent.id, "awaiting-proposal");
     const pending = snapshot.interactions.filter(row => row.status === "pending");
     const proposals = pending.filter(isProposal);
     if (proposals.length > 1 || pending.some(row => row.kind === "ask_user_questions" && row.id !== opening[0]!.id)) fail("onboarding_proposal_scope_unclear");

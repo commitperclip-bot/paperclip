@@ -1,9 +1,11 @@
+import { assertDurableChatWakeupRequest, assertDurableChatWakeupReceipt, type DurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 import { notifyExecutionRunWork } from "./execution-control-notifications.js";
 import { canSelectFreshWorkspace, type ContinuationReadiness } from "./fresh-workspace-continuation.js";
 import { readTaskRetryIntent } from "./task-retry.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
+import { preserveNativeFailedWorkspace } from "./native-runtime/native-failed-workspace-recovery.js";
 import { createHash } from "node:crypto";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { canContinueCancelledRun } from "./run-cancellation.js";
@@ -28,8 +30,47 @@ import { activeIssueInteractionCondition } from "./issue-question-context.js";
 import { historicalAdapterType, isConversationAdapter } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 
-type Run = typeof heartbeatRuns.$inferSelect;
+type Run = Pick<typeof heartbeatRuns.$inferSelect,
+  "id" | "companyId" | "agentId" | "status" | "startedAt" | "finishedAt" | "createdAt" |
+  "issueId" | "nativeIssueId" | "nativeSessionId" | "runnerInstanceId" | "runtimeMode" |
+  "runtimeModeResolvedAt" | "errorCode" | "error" | "resultJson" | "contextSnapshot" |
+  "runnerProfileJson" | "processPid" | "processGroupId" | "processStartedAt" |
+  "sessionIdAfter" | "controllerBootId" | "controllerLeaseExpiresAt" | "executionStage">;
+const continuationContextKeys = ["issueId", "wakeCommentId", "wakeCommentIds", "source",
+  "connectionIntentResolution", "interactionKind", "interactionStatus", "mutation", "interactionId"];
+const continuationContext = sql<Run["contextSnapshot"]>`case
+  when ${heartbeatRuns.contextSnapshot} is null then null else (
+    select coalesce(jsonb_object_agg(field.key, field.value), '{}'::jsonb)
+    from jsonb_each(case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
+      then ${heartbeatRuns.contextSnapshot} else '{}'::jsonb end) as field(key, value)
+    where field.key in (${sql.join(continuationContextKeys.map(key => sql`${key}`), sql`, `)})
+  ) end`;
+const preflightProfile = sql<Run["runnerProfileJson"]>`case
+  when ${heartbeatRuns.runnerProfileJson} is null then null else (
+    select coalesce(jsonb_object_agg(field.key, case when field.key = 'adapterDispatch'
+      then jsonb_build_object('adapterType', field.value->'adapterType') else field.value end), '{}'::jsonb)
+    from jsonb_each(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object'
+      then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) as field(key, value)
+    where field.key in ('adapterDispatch', 'nativeWorkspaceSync')
+  ) end`;
+const continuationRunFields = {
+  id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+  status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt, finishedAt: heartbeatRuns.finishedAt,
+  createdAt: heartbeatRuns.createdAt, issueId: heartbeatRuns.issueId, nativeIssueId: heartbeatRuns.nativeIssueId,
+  nativeSessionId: heartbeatRuns.nativeSessionId, runnerInstanceId: heartbeatRuns.runnerInstanceId,
+  runtimeMode: heartbeatRuns.runtimeMode, runtimeModeResolvedAt: heartbeatRuns.runtimeModeResolvedAt,
+  errorCode: heartbeatRuns.errorCode, error: heartbeatRuns.error, resultJson: heartbeatRuns.resultJson,
+  contextSnapshot: continuationContext, runnerProfileJson: heartbeatRuns.runnerProfileJson,
+  processPid: heartbeatRuns.processPid, processGroupId: heartbeatRuns.processGroupId,
+  processStartedAt: heartbeatRuns.processStartedAt, sessionIdAfter: heartbeatRuns.sessionIdAfter,
+  controllerBootId: heartbeatRuns.controllerBootId, controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt,
+  executionStage: heartbeatRuns.executionStage,
+};
 const terminal = ["failed", "interrupted", "timed_out", "cancelled"];
+
+export function isUserCommentContinuationReason(reason: string | null | undefined): boolean {
+  return reason === "issue_commented" || reason === "issue_reopened_via_comment" || reason === "issue_assigned";
+}
 
 function processStopped(pid: number): boolean {
   try { process.kill(pid, 0); return false; }
@@ -87,6 +128,7 @@ export async function admitExplicitNativeContinuation(input: {
   queuedCommentInterruptId?: string;
   /** Internal delivery of an unconsumed, user-authored saved queue entry. */
   queuedCommentRequestId?: string;
+  durableChatRequest?: DurableChatWakeupRequest;
   dryRun?: boolean;
   onBlocked?: (reason: string, message: string) => void;
 }): Promise<{ previousRunId: string; commentId: string | null; failedRunId?: string; taskRetryRequestId?: string; readiness?: ContinuationReadiness } | null> {
@@ -96,7 +138,7 @@ export async function admitExplicitNativeContinuation(input: {
   const retry = input.reason === "retry_failed_run" &&
     z.string().guid().safeParse(input.failedRunId).success;
   if (!retry && !input.taskRetryRequestId && !input.queuedCommentInterruptId && (!commentId || !z.string().guid().safeParse(commentId).success ||
-      !["issue_commented", "issue_reopened_via_comment"].includes(input.reason ?? ""))) return null;
+      !isUserCommentContinuationReason(input.reason))) return null;
   const [task] = await db.select().from(issues).where(and(
     eq(issues.companyId, companyId), eq(issues.id, issueId),
   ));
@@ -131,6 +173,21 @@ export async function admitExplicitNativeContinuation(input: {
     !savedQueue.idempotencyKey?.startsWith("chat-inbound:") &&
     queuedCommentIdsFromWakePayload(savedQueue.payload).includes(commentId));
   if (input.queuedCommentRequestId && !queuedRequest) return null;
+  const chatRequest = input.durableChatRequest;
+  let savedChatRequestId: string | undefined;
+  if (chatRequest) {
+    assertDurableChatWakeupRequest(chatRequest, { companyId, issueId, agentId, commentId,
+      requestedByActorType: input.actorType ?? undefined, requestedByActorId: actorId });
+    if (chatRequest.failedRunRetry || !chatRequest.resumeDeferred) return null;
+    const [receipt] = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.id, chatRequest.id), eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      isNull(agentWakeupRequests.runId), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+    ));
+    if (!receipt || !commentId || !queuedCommentIdsFromWakePayload(receipt.payload).includes(commentId)) return null;
+    assertDurableChatWakeupReceipt(chatRequest, receipt);
+    savedChatRequestId = receipt.id;
+  }
   let partiallyDeliveredQueue = false;
   if (queuedRequest) {
     const ids = queuedCommentIdsFromWakePayload(savedQueue!.payload);
@@ -183,7 +240,7 @@ export async function admitExplicitNativeContinuation(input: {
     const runId = action.evidence.runId ?? action.evidence.sourceRunId;
     if (typeof runId !== "string") return blocked("source_missing", "The stopped run could not be identified. Your message is saved.");
     // Text comparison keeps malformed historical evidence a hold, not a UUID cast error.
-    let [run] = await db.select().from(heartbeatRuns).where(and(
+    let [run] = await db.select({ ...continuationRunFields, runnerProfileJson: preflightProfile }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.id}::text = ${runId}`,
     ));
     if (!run || run.agentId !== agentId || !terminal.includes(run.status) ||
@@ -194,20 +251,18 @@ export async function admitExplicitNativeContinuation(input: {
     const unusedAdmission = run.status === "cancelled" && !run.startedAt &&
       run.errorCode === "execution_reconciliation_required" &&
       !run.processPid && !run.processGroupId && !run.nativeSessionId;
-    // Several retained holds may describe this same failed execution. Reuse
-    // its current explicit Retry strategy for a historical hold that predates
-    // system recovery. Every hold still passes the stop/effect checks below.
     const sourceRunId = run.id;
-    const strategyEvidence = input.taskRetryRequestId && !Object.hasOwn(action.evidence, "systemRecovery")
+    const strategyRequestId = input.taskRetryRequestId ?? input.queuedCommentRequestId ?? savedChatRequestId;
+    const strategyEvidence = strategyRequestId && !Object.hasOwn(action.evidence, "systemRecovery")
       ? actions.find(candidate => {
           const recovery = readSystemRecovery(candidate.evidence);
           return candidate.evidence.runId === sourceRunId && recovery?.sourceRunId === sourceRunId &&
-            recovery.intentId === input.taskRetryRequestId;
+            (input.taskRetryRequestId ? recovery.intentId === input.taskRetryRequestId : true);
         })?.evidence ?? action.evidence
       : action.evidence;
     const freshIntent = await canSelectFreshWorkspace({ db, companyId, issueId, agentId, actorId,
       sourceRunId: run.id, evidence: strategyEvidence, taskRetryRequestId: input.taskRetryRequestId,
-      queuedRequestId: input.queuedCommentRequestId });
+      queuedRequestId: input.queuedCommentRequestId ?? savedChatRequestId });
     const legacyUserTurn = run.runtimeMode === "legacy" &&
       action.cause === "legacy_execution_requires_reconciliation" &&
       (isConversationAdapter(agent.adapterType) ||
@@ -231,7 +286,7 @@ export async function admitExplicitNativeContinuation(input: {
     )).for("update");
     // Same lock order as the native claim. Re-read the run while holding both
     // locks before accepting the never-claimed startup proof.
-    const [lockedRun] = await db.select().from(heartbeatRuns).where(and(
+    const [lockedRun] = await db.select(continuationRunFields).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, run.id),
     )).for("update");
     if (!lockedRun || lockedRun.status !== run.status || lockedRun.agentId !== run.agentId ||
@@ -294,6 +349,10 @@ export async function admitExplicitNativeContinuation(input: {
           run.status === "cancelled" && !coordinator.leaseOwner
             ? "The cancelled run still needs verified cleanup. Your message is saved. Inspect the run and its environment for details."
             : "Waiting for the previous run to finish recovery. Your message will start automatically.");
+    const preserved = hasRequiredWorkspaceRecovery(run.resultJson) ? null
+      : await preserveNativeFailedWorkspace(db, run);
+    if (preserved && hasRequiredWorkspaceRecovery(preserved.resultJson)) return blocked("workspace_repair_required",
+      "Paperclip is recovering saved work before continuing. Your message is saved.");
     const leases = await db.select()
       .from(environmentLeases).where(and(
         eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, run.id),

@@ -595,6 +595,9 @@ async function runAttempt(input: {
     };
     if (gateway) {
       applyEvalGatewayEnvironment(childEnv, execution.profile.credential, gateway);
+      // The fixture/server controller needs Daytona provisioning access. The
+      // remote provider still receives only the scoped model and OTLP tokens.
+      if (execution.environment.id === "daytona") childEnv.DAYTONA_API_KEY = process.env.DAYTONA_API_KEY;
     }
     // The database URLs are stripped here and again at the Playwright web-server
     // boundary so a developer's shell can never redirect this paid test.
@@ -715,6 +718,7 @@ async function runAttempt(input: {
             const leak = await findSecretLeakInDirectory(directory, credentials, {
               includeShapes: false,
               sources: credentialSources,
+              ...(label === "Paperclip home" ? { privateCodexRuntimeIdentityRoot: paperclipHome } : {}),
               ignoreFile: (file) => expectedEphemeralCredentials.has(file),
               allowDisappearedFile: (file) =>
                 label === "Paperclip home" &&
@@ -1074,6 +1078,13 @@ async function main() {
   }
 
   if (process.env.PAPERCLIP_E2E_OPERATIONS_MANIFEST && executions.some(execution => execution.task.flow === "provider_connection")) throw new Error("Provider connection campaign has no budgeted routing qualification");
+  if (executions.some(execution => execution.task.flow === "github_review_journey")) {
+    if (options.connectionConfig) throw new Error("Use --github-review-config for the GitHub journey.");
+    const { runGitHubReviewCampaign } = await import("./github-review-launch.js");
+    await runGitHubReviewCampaign({ executions, catalog: runnerMatrix, configFile: options.githubReviewConfig, repositoryRoot, provisionRepository: options.provisionGitHubRepository });
+    return;
+  }
+  if (options.githubReviewConfig || options.provisionGitHubRepository) throw new Error("GitHub journey options require an explicit GitHub review journey selection.");
   if (executions.some(execution => execution.task.flow === "provider_connection")) {
     const { runConnectionCampaign } = await import("./connection-launch.js");
     await runConnectionCampaign({ executions, catalog: runnerMatrix, configFile: options.connectionConfig, repositoryRoot });

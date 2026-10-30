@@ -58,6 +58,7 @@ export function createToolCatalogPublication(db: Db, { now, audit, getConnection
       credentialHeaders?: Record<string, string>;
     } = {},
   ): Promise<ToolCatalogRefreshResult> {
+    await actor?.managementContext?.reauthorize();
     const connection = await getConnectionRow(connectionId);
     if (connection.connectionPurpose === "ai") throw unprocessable("AI connections do not have a tool catalog");
     await assertConnectorConnectionSetupEnabled(connection);

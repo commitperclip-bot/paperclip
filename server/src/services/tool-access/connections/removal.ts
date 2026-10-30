@@ -228,6 +228,7 @@ async function removeConnection(
     companyId?: string,
     actor?: ActorInfo,
   ): Promise<ToolConnectionRemovalResult> {
+    await actor?.managementContext?.reauthorize();
     const connection = await getConnectionRow(connectionId, companyId);
     const [endpoint] = await db.select().from(chatEndpoints).where(and(eq(chatEndpoints.connectionId, connection.id), eq(chatEndpoints.companyId, connection.companyId), eq(chatEndpoints.provider, "slack")));
     if (!endpoint) return removeConnectionUnlocked(connectionId, companyId, actor);
@@ -243,6 +244,7 @@ async function removeConnection(
   }
 
   async function removeConnectionUnlocked(connectionId: string, companyId?: string, actor?: ActorInfo): Promise<ToolConnectionRemovalResult> {
+    await actor?.managementContext?.reauthorize();
     const connection = await getConnectionRow(connectionId, companyId);
     forgetMcpHttpSessions(connection.id);
     const now = new Date();

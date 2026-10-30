@@ -202,6 +202,7 @@ export interface HostServices {
   projects: {
     list(params: WorkerToHostMethods["projects.list"][0]): Promise<WorkerToHostMethods["projects.list"][1]>;
     get(params: WorkerToHostMethods["projects.get"][0]): Promise<WorkerToHostMethods["projects.get"][1]>;
+    resolveGitCredential(params: WorkerToHostMethods["projects.resolveGitCredential"][0], context: WorkerHostCallContext): Promise<string | null>;
     getInstanceSecrets(params: WorkerToHostMethods["projects.getInstanceSecrets"][0]): Promise<WorkerToHostMethods["projects.getInstanceSecrets"][1]>;
     listWorkspaces(params: WorkerToHostMethods["projects.listWorkspaces"][0]): Promise<WorkerToHostMethods["projects.listWorkspaces"][1]>;
     getPrimaryWorkspace(params: WorkerToHostMethods["projects.getPrimaryWorkspace"][0]): Promise<WorkerToHostMethods["projects.getPrimaryWorkspace"][1]>;
@@ -443,6 +444,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "projects.list": "projects.read",
   "projects.get": "projects.read",
   "projects.getInstanceSecrets": "projects.instance-secrets",
+  "projects.resolveGitCredential": "projects.git-credentials",
   "projects.listWorkspaces": "project.workspaces.read",
   "projects.getPrimaryWorkspace": "project.workspaces.read",
   "projects.getWorkspaceForIssue": "project.workspaces.read",
@@ -833,6 +835,14 @@ export function createHostClientHandlers(
     // Projects
     "projects.list": gated("projects.list", async (params) => {
       return services.projects.list(params);
+    }),
+    "projects.resolveGitCredential": gated("projects.resolveGitCredential", async (params, context) => {
+      const companyId = resolveRequiredCompanyId("projects.resolveGitCredential", params, context);
+      const scope = context?.invocationScope?.projectGit;
+      if (!scope || scope.projectId !== params.projectId || (scope.workspaceId && scope.workspaceId !== params.workspaceId)) {
+        throw new Error("Git credentials require a matching host project operation");
+      }
+      return services.projects.resolveGitCredential({ ...params, companyId }, context!);
     }),
     "projects.getInstanceSecrets": gated("projects.getInstanceSecrets", async (params, context) => {
       const companyId = resolveRequiredCompanyId("projects.getInstanceSecrets", params, context);

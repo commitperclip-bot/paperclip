@@ -1,3 +1,5 @@
+import { notifyCompanyRetentionWork } from "./retention-work-notifications.js";
+import { notifyToolReviewChange } from "./tool-review-work-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { agentObservabilityService } from "./agent-observability.js";
 import { withAccountHomeSecretMutationLock } from "@paperclipai/adapter-codex-local/server";
@@ -61,6 +63,8 @@ export async function deleteCompany(db: Db, id: string) {
           .where(eq(companies.id, id)).for("no key update");
         if (!existing) return null;
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.skillSourceSync);
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.secretProposalExpiry, id);
+        await notifyToolReviewChange(tx, id);
         await agentObservabilityService(tx as unknown as Db).removeForCompanyDeletion(id);
         // Finance can reference costs and both can reference runs. Incidents
         // reference policies and approvals; delete these dependents first.
@@ -93,6 +97,7 @@ export async function deleteCompany(db: Db, id: string) {
         await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.companyId, id));
         await tx.delete(issueComments).where(eq(issueComments.companyId, id));
         await tx.delete(approvalComments).where(eq(approvalComments.companyId, id));
+        await notifyCompanyRetentionWork(tx, id);
         await tx.delete(approvals).where(eq(approvals.companyId, id));
         await tx.delete(companySecrets).where(eq(companySecrets.companyId, id));
         await tx.delete(joinRequests).where(eq(joinRequests.companyId, id));

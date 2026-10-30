@@ -1,3 +1,4 @@
+import { projectGitAuthorizationService } from "./project-git-authorization.js";
 import { projectInstanceSecretService } from "./project-instance-secrets.js";
 import { pluginAgentRuntimeState, pluginAgentRuntimeIdentity } from "./plugin-agent-runtime-state.js";
 import { createAgentLifecycle } from "./agent-lifecycle.js";
@@ -1863,6 +1864,11 @@ export function buildHostServices(
     },
 
     projects: {
+      async resolveGitCredential(params, context) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        return projectGitAuthorizationService(db).resolve(params, context.invocationScope?.projectGit);
+      },
       async getInstanceSecrets(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
@@ -3010,7 +3016,7 @@ export function buildHostServices(
       async getRuntime(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
-        return pluginAgentRuntimeState(db, pluginId, companyId, params.agentId);
+        return pluginAgentRuntimeState(db, pluginId, companyId, params.agentId, params.environmentId, params.installEnvironmentSkills);
       },
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);

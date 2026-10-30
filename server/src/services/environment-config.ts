@@ -17,7 +17,7 @@ import { unprocessable } from "../errors.js";
 import { parseObject } from "../adapters/utils.js";
 import { secretService } from "./secrets.js";
 import {
-  resolvePluginSandboxProviderDriverByKey,
+  resolvePluginSandboxProviderConfigSchema,
   validatePluginEnvironmentDriverConfig,
   validatePluginSandboxProviderConfig,
 } from "./plugin-environment-driver.js";
@@ -179,14 +179,10 @@ async function getSandboxProviderConfigSchema(
   db: Db,
   provider: string,
 ): Promise<Record<string, unknown> | null> {
-  const resolved = await resolvePluginSandboxProviderDriverByKey({
+  return resolvePluginSandboxProviderConfigSchema({
     db,
     driverKey: provider,
   });
-  const schema = resolved?.driver.configSchema;
-  return schema && typeof schema === "object" && !Array.isArray(schema)
-    ? schema as Record<string, unknown>
-    : null;
 }
 
 export async function resolveSandboxProviderSecretRefPaths(

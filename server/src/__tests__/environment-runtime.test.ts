@@ -824,7 +824,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const cold = await runtime.acquireRunLease({ ...input, environment, heartbeatRunId: seeded.runId });
     expect(cold.lease.leasePolicy).toBe("ephemeral");
     await runtime.releaseRunLeases(seeded.runId, "released");
-    const warmEnvironment = resolveRunnerEnvironmentForRun(environment, "paperclip_runner", { lifecycleMode: "warm" });
+    const warmEnvironment = resolveRunnerEnvironmentForRun(environment, "paperclip_runner", { lifecycleMode: "warm" }, undefined, "selected-account:generation");
     const warmRunId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: warmRunId, companyId: seeded.companyId, agentId: seeded.agentId, status: "running" });
     const warm = await runtime.acquireRunLease({ ...input, environment: warmEnvironment, heartbeatRunId: warmRunId });

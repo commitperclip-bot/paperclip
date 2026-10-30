@@ -46,6 +46,11 @@ const mockEnvironmentRuntime = vi.hoisted(() => ({
 }));
 
 const mockResolveEnvironmentExecutionTarget = vi.hoisted(() => vi.fn());
+const mockPluginEnvironmentRequiresAgent = vi.hoisted(() => vi.fn(async () => false));
+vi.mock("../services/plugin-environment-driver.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../services/plugin-environment-driver.js")>()),
+  pluginEnvironmentRequiresAgent: mockPluginEnvironmentRequiresAgent,
+}));
 const mockInstanceSettingsService = vi.hoisted(() => ({
   get: vi.fn(async () => ({ defaultEnvironmentId: null as string | null })),
   getGeneral: vi.fn(async () => ({ censorUsernameInLogs: false, executionMode: "local" })),
@@ -1051,6 +1056,19 @@ describe("agent test-environment route", () => {
     beforeEach(() => {
       mockEnvironmentService.getById.mockResolvedValue(pluginEnvironment);
       mockResolveNewAgentRunnerForCompany.mockClear();
+    });
+
+    it("reports the missing agent prerequisite without acquiring a lease or probing the host", async () => {
+      mockPluginEnvironmentRequiresAgent.mockResolvedValueOnce(true);
+      mockResolveNewAgentRunnerForCompany.mockResolvedValueOnce({ adapterType: "paperclip_runner", adapterConfig: { provider: "codex" } });
+      const app = await createApp();
+      const res = await request(app)
+        .post("/api/companies/company-1/adapters/codex_local/test-environment")
+        .send({ adapterConfig: {}, environmentId: pluginEnvironment.id });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toMatchObject({ status: "warn", checks: [{ code: "environment_agent_required", level: "warn" }] });
+      expect(mockEnvironmentRuntime.acquireRunLease).not.toHaveBeenCalled();
+      expect(testEnvironmentSpy).not.toHaveBeenCalled();
     });
 
     it("checks the plugin driver against the resolved Runner adapter, not the requested harness", async () => {

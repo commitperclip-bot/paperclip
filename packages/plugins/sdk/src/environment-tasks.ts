@@ -39,6 +39,7 @@ export const environmentRunnerLaunchRequirementsSchema = z.object({
     acpxPermissionModePinned: z.boolean().optional(), piThinkingLevel: z.enum(["off", "low", "high", "max"]).optional(),
     claudeEffort: z.enum(["low", "medium", "high", "xhigh", "max"]).optional(),
     opencodePermissionMode: z.enum(["allow", "ask", "deny"]).optional(),
+    disableCodexWebSearch: z.literal(true).optional(),
     managedProfile: z.record(z.string(), z.unknown()).optional(), agentCoreProfile: z.record(z.string(), z.unknown()).optional(),
   }).strict(),
   approvalPolicy: z.enum(["never", "on-request", "untrusted"]), readOnly: z.boolean(),

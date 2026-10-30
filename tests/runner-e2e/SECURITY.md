@@ -1,5 +1,12 @@
 # Runner E2E security for a public repository
 
+The explicit [chat feature evals](CHAT-FEATURES.md) use synthetic project briefs
+and a privately supplied Codex subscription login through the existing isolated
+company staging helper. Only source-chat screenshots are captured. Task, document
+and run evidence stays behind the existing sanitizer and publication allowlist;
+the YAML catalog contains no credentials. The suite's accounted-work budgets do
+not cover production setup probes or imply zero subscription cost.
+
 [Cloud Product journey bundles](PRODUCT-JOURNEYS.md) are always private and
 rejected by public history publication. Authentication uses an isolated browser
 context without saved storage state or auth tracing. Only closed error codes
@@ -13,6 +20,23 @@ inside private normalized results. The receipt contains generated numeric inputs
 their expected four-field result, exact base64 download bytes, checksums, size,
 and attachment/run IDs. Extra fields and arbitrary agent output are rejected.
 It contains no credentials, browser state, request headers, or provider text.
+
+The optional `onboardingConnect` diagnostic is also a closed, versioned receipt.
+It retains only a known checkpoint, response states, HTTP statuses, known adapter
+names, and allowlisted outcome/check/server codes (at most 32 checks per response).
+Unknown codes become `unrecognized`; raw bodies, messages, URLs, headers, and
+browser errors are excluded. Reports validate the receipt before rendering its
+explicit fields, and historical results may omit it.
+
+The optional `onboardingPreAcceptance` receipt captures only a failing first-task
+acceptance guard. Its closed version-1 fields are a known checkpoint, up to four
+distinct guard-violation codes, nonnegative integer task/attachment/document
+counts, a canonical-parent match boolean, and closed first-task/canonical-parent
+statuses (`missing` and `unknown` remain explicit). It excludes all identifiers,
+task text, document keys and bodies, filenames, URLs, credentials, and raw API
+responses. Validation rejects extra or inconsistent fields before report use;
+older results may omit the receipt. It preserves the original failure grade and
+does not attribute a product cause or authorize acceptance.
 
 ## Attended connection authentication
 
@@ -46,13 +70,17 @@ changes.
 
 ## GitHub authorization
 
-The Everyday remote Codex restart oracle reads only the existing public run,
+The Everyday remote native restart oracle reads only the existing public run,
 event, environment-lease, workspace-operation and recovery APIs. It does not
 execute commands in a provider sandbox or signal a provider process. Its new
 evidence projects closed receipt metadata and hashes the provider sandbox ID
 and full native event content. Provider text, tool arguments and command output
 do not enter these snapshots. Existing image admission, credentials, billing,
 retention and cleanup rules continue to apply.
+The isolated server's private restart request may delay its replacement by at
+most five minutes. This fault injection never stops a hosted instance or a
+provider sandbox. The explicit Daytona continuity suite has one attempt and
+1,000-cent company and agent hard stops.
 
 Set `RUNNER_E2E_ALLOWED_ACTOR_IDS` to a non-empty JSON array of numeric GitHub
 user IDs. Keep the list equal to the owners of `.github/**` in
@@ -118,8 +146,12 @@ and account identifiers inside its JSON join the evidence redaction set. The
 subscription suite remains manual-only and never falls back to `XAI_API_KEY`.
 
 Create `runner-e2e-paid`, restrict deployments to the default branch, and put
-only `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `XAI_API_KEY`, and
-`DAYTONA_API_KEY` in it. `KIMI_MODEL_API_KEY` remains a local-only catalog name
+only provider credentials needed by the selected paid suites, including
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `XAI_API_KEY`,
+`COPILOT_GITHUB_TOKEN` and `DAYTONA_API_KEY` in it. Copilot is passed only to
+cells selecting `credentialName: COPILOT_GITHUB_TOKEN`, in the paid Product or
+direct-protocol execution step. Never expose it to ordinary PR, build, catalog,
+image or report jobs. `KIMI_MODEL_API_KEY` remains a local-only catalog name
 for pending explicit profiles and is intentionally absent from the workflow
 environment. Product E2E pending-profile admission remains gated separately.
 Do not duplicate these credentials as repository- or
@@ -407,6 +439,18 @@ server environments and public attempt evidence by the existing credential
 boundary; do not print it or store it in tracked configuration. The original
 arithmetic cell remains subscription-only.
 
+Upstream Codex also records its subscription account ID in `logs_N.sqlite`,
+`state_N.sqlite` (thread ownership), and their WAL/SHM companions. The isolated-home persistence scan permits only that
+identity value in those exact managed runtime log paths, inside an owner-only
+temporary root. It still scans the entire file for every token and other secret;
+an identity reused as a credential gets no exception. The private rollout scan
+also recognizes only the exact `session_meta.payload.creator_account_id` ownership
+field; all instruction/message content and all other fields retain the full scan.
+Config, workspaces, unrelated files and all packaged/public evidence retain the
+full redaction set. These private databases and rollouts are never copied into evidence and are
+removed with the disposable instance. Historical attempts rejected by the older
+persistence policy remain failed.
+
 Case screenshots use the exact case ID/identifier returned by that fixture's
 public kickoff, in addition to its ordinary task route. Other cases, setup,
 settings and external hosts remain outside the public screenshot allowlist.
@@ -490,6 +534,17 @@ forwarded to a fixed provider or Braintrust HTTPS origin; request headers do not
 select arbitrary destinations. Gateway response caching and fallback are refused.
 Request journal and usage receipts contain no prompt/response bodies or keys.
 The manifest, journal, and receipts are not public report projections.
+
+`boundedEvalPayload` is the shared, credential-free request validator and
+normalizer. Qualification callers must apply it before recording budget-denial
+proof. The forwarding path applies the same policy before a ledger reservation.
+OpenAI tools may use one namespace level around local function or custom tools.
+Function and custom leaves require nonblank string names.
+Namespace wrappers contain only `type`, `name`, optional `description`, and
+`tools`. Nested namespaces, hosted tools, and tool lists attached to leaves fail
+closed. The request may contain at most 1,024 tool definitions, counting namespace
+wrappers and their children. Anthropic tool policy stays separate. Output limits,
+billing-mode restrictions, and multimodal exclusions apply in both paths.
 
 ## Configured repository and conversion proof
 

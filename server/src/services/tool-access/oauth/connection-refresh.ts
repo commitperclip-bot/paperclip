@@ -366,6 +366,7 @@ const oauthRefreshFlights = new Map<string, Promise<unknown>>();
       heartbeatRunId?: string | null;
     },
   ): Promise<typeof toolConnections.$inferSelect> {
+    await actor?.managementContext?.reauthorize();
     const oauth = oauthConfig(connection);
     if (
       typeof oauth.tokenUrl !== "string" ||

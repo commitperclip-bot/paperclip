@@ -264,6 +264,7 @@ async function restartIsolatedPaperclipServer(input: {
   deadlineAt: number;
   preserveRunner?: RestartRunnerIdentity;
   crashAfterResult?: FinalizationCrashBinding;
+  controllerDowntimeMs?: number;
 }): Promise<void> {
   const {
     controlDirectory,
@@ -274,7 +275,8 @@ async function restartIsolatedPaperclipServer(input: {
   const temporaryRequestPath = `${requestPath}.${process.pid}.${input.requestId}.tmp`;
   await writeFile(
     temporaryRequestPath,
-    JSON.stringify({ requestId: input.requestId, ...(input.preserveRunner ? { preserveRunner: input.preserveRunner } : {}),
+    JSON.stringify({ requestId: input.requestId, ...(input.controllerDowntimeMs !== undefined ? { controllerDowntimeMs: input.controllerDowntimeMs } : {}),
+      ...(input.preserveRunner ? { preserveRunner: input.preserveRunner } : {}),
       ...(input.crashAfterResult ? { crashAfterResult: input.crashAfterResult } : {}) }),
     { encoding: "utf8", mode: 0o600 },
   );
@@ -955,7 +957,7 @@ for (const execution of executions) {
         daytonaImage: process.env.PAPERCLIP_E2E_DAYTONA_IMAGE,
         onCompanyCreated,
       });
-      await finishBudgetedEvalSetup({ executionId: execution.id, agentId: fixtures.agent.id,
+      await finishBudgetedEvalSetup({ executionId: execution.id, environmentId: execution.environment.id, agentId: fixtures.agent.id,
         companyId: fixtures.company.id, deadlineAt: startedAtMs + deadlineMs, api,
         observe: observations => writeSanitizedJson(snapshotsDir, "budgeted-setup.json", { observations }, secrets) });
       await workerTiming.enter("execution");
@@ -1240,7 +1242,7 @@ for (const execution of executions) {
         const story = await runEverydayFlow({
           page, api, fixtures, execution, nonce, workspacePath, privateDir,
           deadlineAt: startedAtMs + deadlineMs,
-          restart: () => restartIsolatedPaperclipServer({ api, requestId: `story-${nonce}`, deadlineAt: startedAtMs + deadlineMs }),
+          restart: controllerDowntimeMs => restartIsolatedPaperclipServer({ api, requestId: `story-${nonce}`, deadlineAt: startedAtMs + deadlineMs, controllerDowntimeMs }),
           observe: (storyIssue, storyRuns) => { issue = storyIssue; selectedRuns = storyRuns; },
           capture: captureScreenshot,
           evidence: (name, data) => writeSanitizedJson(snapshotsDir, name, data, secrets),

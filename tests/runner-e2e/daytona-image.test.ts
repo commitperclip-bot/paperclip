@@ -55,8 +55,12 @@ describe("runner E2E Daytona image contract", () => {
       await mkdir(path.dirname(path.join(root, fixturePath)), { recursive: true });
       await writeFile(path.join(root, fixturePath), '{"commandDigest":"before"}\n');
       const before = await computeDaytonaImageContentId(options);
+      expect(await computeDaytonaImageContentId(options)).toBe(before);
+      const withoutCopilot = { ...options, inputPaths: [] };
+      const unrelatedBefore = await computeDaytonaImageContentId(withoutCopilot);
       await writeFile(path.join(root, fixturePath), '{"commandDigest":"after"}\n');
       expect(await computeDaytonaImageContentId(options)).not.toBe(before);
+      expect(await computeDaytonaImageContentId(withoutCopilot)).toBe(unrelatedBefore);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

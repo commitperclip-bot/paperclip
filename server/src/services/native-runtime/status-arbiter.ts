@@ -1,7 +1,7 @@
 import type { NativeEvidenceAssessment } from "./evidence-classifier.js";
 import { NATIVE_MODEL_REJECTION_MESSAGE, NATIVE_PROVIDER_CAPACITY_MAX_RETRIES, NATIVE_PROVIDER_OVERLOADED_CODE, NATIVE_PROVIDER_OVERLOADED_MESSAGE } from "./native-provider-failure.js";
 
-export const NATIVE_STATUS_ARBITER_POLICY_VERSION = "phase6-v12";
+export const NATIVE_STATUS_ARBITER_POLICY_VERSION = "phase6-v13";
 
 export type NativeAuthoritativeIssueStatus =
   | "backlog"
@@ -118,6 +118,7 @@ export function arbitrateNativeStatus(input: {
   caseHandoffAuthorized?: boolean;
   /** The saved timer already admitted another run and this run no longer owns checkout. */
   monitorWaitDispatched?: boolean;
+  monitorWaitPreserved?: boolean;
   boardResponseWaitAuthorized?: boolean;
   boardResponseWaitOrigin?: boolean;
   isConversation?: boolean;
@@ -481,6 +482,13 @@ export function arbitrateNativeStatus(input: {
         // Delivery already happened. Preserve successor ownership and never
         // re-arm its timer or repeat the completed provider turn.
         effects: [],
+      };
+    }
+    if (input.monitorWaitPreserved) {
+      return {
+        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+        statusAction: "preserve", toStatus: input.priorIssueStatus,
+        reasonCode: "scheduled_monitor_preserved", unblockDescriptor: null, effects: [],
       };
     }
     if (input.monitorWaitAuthorized) {

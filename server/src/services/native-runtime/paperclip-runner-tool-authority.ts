@@ -103,6 +103,7 @@ import {
   type CurrentWakeCommentsBinding,
 } from "./current-wake-comments.js";
 import {
+  readPublishedGitHubReviewCompletionContinuation,
   authorizeChatAttachmentReuse,
   authorizeChatConversationForBoundRun,
   LIST_CHAT_ATTACHMENTS_TOOL_DEFINITION,
@@ -314,12 +315,13 @@ export class PaperclipRunnerToolAuthority {
             : descriptor.inputSchema,
       }));
     // Keep the provider session's direct tool catalog stable across ordinary
-    // and truncated external-chat turns. Execution still fails closed unless
-    // this exact run carries a server-verified current-wake binding.
-    if (this.binding.currentWakeComments) definitions.push(READ_CURRENT_WAKE_COMMENTS_TOOL_DEFINITION);
+    // and truncated external-chat turns: Codex thread/resume cannot add tools,
+    // so a reader missing at thread/start stays missing. Execution still fails
+    // closed unless this exact run carries the server-verified binding/scope.
+    definitions.push(READ_CURRENT_WAKE_COMMENTS_TOOL_DEFINITION);
     definitions.push(LIST_CHAT_ATTACHMENTS_TOOL_DEFINITION);
     definitions.push(REUSE_CHAT_ATTACHMENT_TOOL_DEFINITION);
-    if (this.binding.chatAttachmentReadScope) definitions.push(READ_CHAT_ATTACHMENT_TOOL_DEFINITION);
+    definitions.push(READ_CHAT_ATTACHMENT_TOOL_DEFINITION);
     if (this.binding.taskAttachmentRead) definitions.push(...TASK_ATTACHMENT_DEFINITIONS);
     definitions.push(...runnerBridgeDefinitions({ workspace: !this.binding.firstPartyOnly && !!this.binding.workspaceRoot && this.binding.workspaceBridge === true, skills: !!this.binding.runtimeContext, api: runnerApiToolsEnabled(this.binding.companyId, this.binding.apiToolsEnabled), mode: workMode }));
     const connectionTools = this.binding.firstPartyOnly ? [] : [...RUNTIME_CONNECTION_TOOL_DEFINITIONS,
@@ -449,14 +451,14 @@ export class PaperclipRunnerToolAuthority {
     }
     if (isConnectorTool(call.tool)) {
       if (!(this.binding.connectorAssignments ?? []).some((assignment) => assignment.tools.some((tool) => tool.name === call.tool))) throw forbidden("Connector tool is not available to this run");
-      const { run } = await this.#boundContext();
+      const { run } = await this.#boundContext({ includeChatWake: call.tool.startsWith("agentmail_") });
       const snapshot = record(run.contextSnapshot);
       if (call.tool.startsWith("agentmail_") && (isPaperclipExternalChatContractTurn(snapshot.paperclipWake) || String(snapshot.source ?? "").startsWith("chat:") || snapshot.paperclipExternalChatQuestionResponse)) throw forbidden("Restricted chat runs cannot use email actions");
       return executeConnectorTool(this.db, this.binding, call.tool, call.arguments);
     }
     if (RUNTIME_CONNECTION_TOOL_DEFINITIONS.some((tool) => tool.name === call.tool)) {
       await this.#boundContext();
-      const { run } = await captureRunIdentity(this.db, this.binding);
+      const { run } = await captureRunIdentity(this.db, this.binding, { readScope: "identity" });
       if (!run.responsibleUserId) throw forbidden("This task needs a responsible user before requesting a connection");
       const claims = {
         sub: this.binding.agentId, company_id: this.binding.companyId,
@@ -687,6 +689,7 @@ export class PaperclipRunnerToolAuthority {
           } : !this.binding.nativeReview && context.issue.workMode === "standard" && context.issue.executionRunId === this.binding.runId
             ? await pendingTaskRepositoryContinuation(this.db, { companyId: this.binding.companyId, issueId: this.binding.issueId,
                 runId: this.binding.runId, workspaceId: context.issue.executionWorkspaceId })
+              ?? await readPublishedGitHubReviewCompletionContinuation({ db: this.db, binding: this.binding })
             : null,
           childTasks: visibleChildTasks.slice(0, 100).map(redactedTask),
           childTasksTruncated: childTasks.length > 100,
@@ -791,9 +794,9 @@ export class PaperclipRunnerToolAuthority {
       }
       case "report_progress": return this.#reportProgress(input);
       case "request_human_input": return this.#requestHumanInput(input,
-        (await captureRunIdentity(this.db, this.binding)).context?.id ?? null);
+        (await captureRunIdentity(this.db, this.binding, { readScope: "identity" })).context?.id ?? null);
       case "create_task": return this.#createTask(input,
-        (await captureRunIdentity(this.db, this.binding)).context?.id ?? null);
+        (await captureRunIdentity(this.db, this.binding, { readScope: "identity" })).context?.id ?? null);
       case "reassign_task": return this.#reassignTask(input);
       case "set_task_title": return this.#setTaskTitle(input);
       case "set_task_monitor": return this.#setTaskMonitor(input);
@@ -1225,9 +1228,24 @@ export class PaperclipRunnerToolAuthority {
       ...(this.binding.museRuntime ? { authorizingUserId: this.binding.externalAuthorizingUserId } : {}) };
   }
 
-  async #boundContext() {
+  async #boundContext(options: { includeChatWake?: boolean } = {}) {
     if (this.binding.museRuntime && !this.binding.externalAuthorizingUserId) throw forbidden("Muse authorizer is unavailable");
-    const [row] = await this.db.select({ issue: issues, actor: agents, run: heartbeatRuns })
+    const [row] = await this.db.select({ issue: issues, actor: agents, run: {
+      id: heartbeatRuns.id,
+      companyId: heartbeatRuns.companyId,
+      agentId: heartbeatRuns.agentId,
+      runtimeMode: heartbeatRuns.runtimeMode,
+      status: heartbeatRuns.status,
+      invocationSource: heartbeatRuns.invocationSource,
+      responsibleUserId: heartbeatRuns.responsibleUserId,
+      contextSnapshot: sql<Record<string, unknown> | null>`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
+        then ${heartbeatRuns.contextSnapshot} - array['executionContinuation', 'paperclipTaskMarkdown',
+          'paperclipTaskMarkdownCompact', 'paperclipTaskMarkdownAssignment', 'paperclipTaskMarkdownAssignmentCompact',
+          'paperclipWorkspace', 'paperclipEnvironment', 'paperclipContinuationSummary', 'paperclipWakeComment']
+          ${options.includeChatWake ? sql`` : sql`- 'paperclipWake'`}
+        else ${heartbeatRuns.contextSnapshot} end`,
+      resultJson: heartbeatRuns.resultJson,
+    } })
       .from(heartbeatRuns)
       .innerJoin(issues, eq(issues.id, this.binding.issueId))
       .innerJoin(agents, eq(agents.id, this.binding.agentId))
@@ -2168,7 +2186,7 @@ export class PaperclipRunnerToolAuthority {
     });
   }
 
-  async #sourcePlanApproval(context: { issue: typeof issues.$inferSelect; run: typeof heartbeatRuns.$inferSelect }) {
+  async #sourcePlanApproval(context: { issue: typeof issues.$inferSelect; run: Pick<typeof heartbeatRuns.$inferSelect, "responsibleUserId"> }) {
     const plan = await handoffPlanContext(this.db, context.issue, this.#privacyActor(context.run));
     if (!plan || !this.binding.museRuntime) return plan;
     const document = await documentService(this.db).getIssueDocumentByKey(plan.sourceIssueId, "plan");

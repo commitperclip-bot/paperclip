@@ -293,6 +293,7 @@ async function waitForHealthToStop() {
 
 interface RestartRequest {
   requestId: string;
+  controllerDowntimeMs?: number;
   preserveRunner?: RestartRunnerIdentity;
   crashAfterResult?: FinalizationCrashBinding;
 }
@@ -321,9 +322,15 @@ async function readRestartRequest(): Promise<RestartRequest | null> {
     return null;
   }
   const preserveRunner = (value as { preserveRunner?: unknown }).preserveRunner;
+  const controllerDowntimeMs = (value as { controllerDowntimeMs?: unknown }).controllerDowntimeMs;
+  if (controllerDowntimeMs !== undefined && (!Number.isSafeInteger(controllerDowntimeMs)
+    || Number(controllerDowntimeMs) < 0 || Number(controllerDowntimeMs) > 300_000)) {
+    throw new Error("Controller downtime must be an integer between zero and five minutes");
+  }
   const crashAfterResult = (value as { crashAfterResult?: unknown }).crashAfterResult;
   if (crashAfterResult !== undefined && preserveRunner !== undefined) throw new Error("A finalization crash cannot preserve a running provider");
-  return { requestId, ...(preserveRunner === undefined ? {} : { preserveRunner: parseRestartRunnerIdentity(preserveRunner) }),
+  return { requestId, ...(controllerDowntimeMs === undefined ? {} : { controllerDowntimeMs: Number(controllerDowntimeMs) }),
+    ...(preserveRunner === undefined ? {} : { preserveRunner: parseRestartRunnerIdentity(preserveRunner) }),
     ...(crashAfterResult === undefined ? {} : { crashAfterResult: parseFinalizationCrashBinding(crashAfterResult) }) };
 }
 
@@ -348,7 +355,7 @@ async function writeRestartAck(
   await rename(temporaryAckPath, restartAckPath);
 }
 
-async function restartServer({ requestId, preserveRunner, crashAfterResult }: RestartRequest) {
+async function restartServer({ requestId, preserveRunner, crashAfterResult, controllerDowntimeMs = 0 }: RestartRequest) {
   activeRestartRequestId = requestId;
   appendLog(`\nRestart request ${requestId}: stopping Paperclip\n`);
   const previous = child;
@@ -365,6 +372,11 @@ async function restartServer({ requestId, preserveRunner, crashAfterResult }: Re
   // Do not mistake an orphaned old server for a healthy replacement. The port
   // must stop answering before the next launcher is allowed to start.
   await waitForHealthToStop();
+  const downtimeDeadline = Date.now() + controllerDowntimeMs;
+  while (Date.now() < downtimeDeadline) {
+    if (shutdownRequested()) throw new Error("Wrapper shutdown interrupted controller downtime");
+    await delay(Math.min(250, downtimeDeadline - Date.now()));
+  }
   if (shutdownRequested()) {
     throw new Error("Wrapper shutdown interrupted the Paperclip restart");
   }

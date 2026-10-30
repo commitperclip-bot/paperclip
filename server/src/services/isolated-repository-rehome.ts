@@ -23,7 +23,7 @@ import { withExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifec
 import { loadGitRestorePoint } from "./git-restore-point-storage.js";
 import { nestedWorktreeBranchPrefix, readLinkedNestedCheckout, repairMovedNestedRepositoryWorktree, withNestedRepositoryBaseLock } from "./nested-repository-worktrees.js";
 import { getStorageService } from "../storage/index.js";
-import { createGitRemoteAuthProvider } from "./git-credentials.js";
+import { createIssueGitRemoteAuthProvider } from "./git-credentials.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 
 const execFile = promisify(execFileCallback);
@@ -598,7 +598,7 @@ async function worktreeOfClone(worktree: string, cloneReal: string, signal?: Abo
 }
 
 function upstreamCheck(db: Db, companyId: string, issueId: string, clone: string, repoUrl: string, signal?: AbortSignal): MissingUpstream {
-  const auth = withAnonymousGitFallback(createGitRemoteAuthProvider(db, companyId, { issueId }));
+  const auth = withAnonymousGitFallback(createIssueGitRemoteAuthProvider(db, companyId, issueId));
   return (commits, covered) => hasCommitsMissingUpstream(clone, commits, repoUrl, auth, signal, covered);
 }
 

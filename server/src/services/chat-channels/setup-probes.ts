@@ -1,3 +1,4 @@
+import type { ConnectionManagementContext } from "../connection-management.js";
 import type { EndpointRow, DbOrTransaction } from "./runtime-types.js";
 
 import { notifyChatEndpointWork } from "../chat-work-notifications.js";
@@ -94,7 +95,8 @@ export function createSetupProbes(db: Db, options: SetupProbesOptions) {
     return { messageReceivedAt: at?.toISOString() ?? null };
   }
 
-  async function test(endpointId: string, finishOptions?: { optionalSlackTestForUser: string }) {
+  async function test(endpointId: string, finishOptions?: { optionalSlackTestForUser: string }, managementContext?: ConnectionManagementContext) {
+    await managementContext?.reauthorize();
     const initial = await endpointRecord(endpointId);
     if (!initial) throw notFound("Chat endpoint not found");
     return withCredentialMutationLease(
@@ -287,6 +289,7 @@ export function createSetupProbes(db: Db, options: SetupProbesOptions) {
           }
         }
         await options.setupTestActivationBarrier?.();
+        await managementContext?.reauthorize();
         const expectedGeneration = runtimeGeneration(endpoint.setup);
         await db.transaction(async (tx) => {
           await credentialLease.assertOwned(tx);
@@ -339,7 +342,7 @@ export function createSetupProbes(db: Db, options: SetupProbesOptions) {
             })
             .where(eq(toolConnections.id, endpoint.connectionId));
           if (optionalSlackTest) await logActivity(tx as unknown as Db, {
-            companyId: endpoint.companyId, actorType: "user", actorId: finishOptions!.optionalSlackTestForUser,
+            companyId: endpoint.companyId, ...(managementContext?.audit ?? { actorType: "user" as const, actorId: finishOptions!.optionalSlackTestForUser }),
             action: "chat.setup_completed", entityType: "chat_endpoint", entityId: endpointId,
             details: { conversationTestOptional: true },
           });

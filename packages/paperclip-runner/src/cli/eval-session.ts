@@ -37,6 +37,8 @@ import {
 } from "./eval-session-contract.js";
 import { evalProviderTransportOptions } from "./eval-provider-runtime.js";
 import { prepareEvalGatewayRuntime } from "./eval-gateway-runtime.js";
+import { prepareEvalObservabilityRuntime } from "./eval-observability-runtime.js";
+import { redactObservabilityDiagnostic } from "../drivers/agent-observability.js";
 import { NativeSessionCloseUnrecoverableError } from "../contracts/native-session-backend.js";
 
 interface EvalSessionCliOptions {
@@ -45,6 +47,7 @@ interface EvalSessionCliOptions {
   candidateProfile?: EvalCandidateProfile;
   expectedAcpxProfile?: Record<string, unknown>;
   gatewayConfigPath?: string;
+  observabilityConfigPath?: string;
 }
 
 function argument(args: string[], name: string): string {
@@ -55,7 +58,7 @@ function argument(args: string[], name: string): string {
 }
 
 export function parseEvalSessionCliArgs(args: string[]): EvalSessionCliOptions {
-  const allowed = new Set(["--request", "--output", "--candidate-profile", "--expected-acpx-profile", "--gateway-config"]);
+  const allowed = new Set(["--request", "--output", "--candidate-profile", "--expected-acpx-profile", "--gateway-config", "--observability-config"]);
   const seen = new Set<string>();
   for (let index = 0; index < args.length; index += 2) {
     if (!allowed.has(args[index] ?? "")) {
@@ -65,6 +68,7 @@ export function parseEvalSessionCliArgs(args: string[]): EvalSessionCliOptions {
     seen.add(args[index]!);
     if (args[index + 1] === undefined || args[index + 1]!.startsWith("--")) throw new Error(`missing ${args[index]}`);
   }
+  if (seen.has("--observability-config") && !seen.has("--gateway-config")) throw new Error("Eval observability requires an explicit controller gateway");
   const candidateIndex = args.indexOf("--candidate-profile");
   const candidateProfile = candidateIndex < 0 ? undefined : args[candidateIndex + 1];
   if (candidateProfile !== undefined && candidateProfile !== "pi" && candidateProfile !== "cursor" && candidateProfile !== "copilot") {
@@ -93,6 +97,7 @@ export function parseEvalSessionCliArgs(args: string[]): EvalSessionCliOptions {
     ...(candidateProfile === undefined ? {} : { candidateProfile }),
     ...(expectedAcpxProfile === undefined ? {} : { expectedAcpxProfile }),
     ...(seen.has("--gateway-config") ? { gatewayConfigPath: argument(args, "--gateway-config") } : {}),
+    ...(seen.has("--observability-config") ? { observabilityConfigPath: argument(args, "--observability-config") } : {}),
     requestPath: argument(args, "--request"),
     outputPath: argument(args, "--output"),
   };
@@ -406,11 +411,14 @@ export async function runEvalSessionCli(
   const gateway = cli.gatewayConfigPath
     ? await prepareEvalGatewayRuntime(cli.gatewayConfigPath, request)
     : undefined;
+  let observability: Awaited<ReturnType<typeof prepareEvalObservabilityRuntime>> | undefined;
+  const redact = (message: string) => redactObservabilityDiagnostic(message, observability?.transportOptions.environment, observability?.transportOptions.observability.otelConfig);
   let session: CapabilityLiveSession | null = null;
   let turn: CapabilityLiveTurnResult | null = null;
   let snapshot: CapabilityLiveSessionSnapshot | null = null;
 
   try {
+    if (cli.observabilityConfigPath) observability = await prepareEvalObservabilityRuntime(cli.observabilityConfigPath, request, gateway!);
     const runtimeContext = await prepareEvalRuntimeContext(
       resolve(request.session.workingDirectory ?? process.cwd()),
     );
@@ -422,8 +430,9 @@ export async function runEvalSessionCli(
       baseInstructions: evalRuntimeSystemInstructions(runtimeContext),
       environment: process.env,
       ...gateway?.transportOptions,
+      ...observability?.transportOptions,
       onDiagnostic: (message) => {
-        process.stderr.write(`[eval-session runnerd] ${message}\n`);
+        process.stderr.write(`[eval-session runnerd] ${redact(message)}\n`);
       },
     };
     const service = options.serviceFactory?.(runnerdPath, transportOptions)
@@ -468,13 +477,14 @@ export async function runEvalSessionCli(
     await closeSession(session, "eval session complete");
     snapshot = session.snapshot();
 
-    await writeFile(cli.outputPath, `${JSON.stringify({
+    await writeFile(cli.outputPath, redact(`${JSON.stringify({
       schema: "paperclip-runner/eval-session-artifact/v1",
       attemptId: request.attemptId,
       build: PAPERCLIP_RUNNER_BUILD_METADATA,
       runnerd: { path: "[withheld]", sha256: `sha256:${actualDigest}` },
       requestedModel: request.model,
       ...(gateway ? { requestRouting: gateway.evidence } : {}),
+      ...(observability ? { nativeObservability: observability.evidence } : {}),
       ...(cli.candidateProfile === undefined ? {} : { diagnosticCandidateProfile: cli.candidateProfile }),
       provider: requestedProvider,
       driver: requestedDriver,
@@ -520,7 +530,7 @@ export async function runEvalSessionCli(
         finishedAt: new Date().toISOString(),
         durationMs: Date.now() - startedAtMs,
       },
-    }, null, 2)}\n`);
+    }, null, 2)}\n`));
     return accountingError === null ? 0 : 2;
   } catch (error) {
     if (session !== null) {
@@ -546,7 +556,7 @@ export async function runEvalSessionCli(
       snapshot = session.snapshot();
     }
     const usage = usageIfAvailable(request, snapshot);
-    await writeFile(cli.outputPath, `${JSON.stringify({
+    await writeFile(cli.outputPath, redact(`${JSON.stringify({
       schema: "paperclip-runner/eval-session-artifact/v1",
       attemptId: request.attemptId,
       infrastructureError: error instanceof Error ? error.message : String(error),
@@ -555,6 +565,7 @@ export async function runEvalSessionCli(
       runnerd: { path: "[withheld]", sha256: `sha256:${actualDigest}` },
       requestedModel: request.model,
       ...(gateway ? { requestRouting: gateway.evidence } : {}),
+      ...(observability ? { nativeObservability: observability.evidence } : {}),
       ...(cli.candidateProfile === undefined ? {} : { diagnosticCandidateProfile: cli.candidateProfile }),
       provider: requestedProvider,
       driver: requestedDriver,
@@ -579,7 +590,7 @@ export async function runEvalSessionCli(
         finishedAt: new Date().toISOString(),
         durationMs: Date.now() - startedAtMs,
       },
-    }, null, 2)}\n`);
+    }, null, 2)}\n`));
     return 2;
   } finally {
     await gateway?.close();

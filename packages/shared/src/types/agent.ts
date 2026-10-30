@@ -25,6 +25,11 @@ export interface AgentPermissions extends Record<string, unknown> {
   authorizationPolicy?: TrustAuthorizationPolicy;
 }
 
+export interface AgentProjectAccess {
+  projectIds: string[];
+  canManage: boolean;
+}
+
 export type AgentRuntimeConfig = Record<string, unknown> & {
   aiConnection?: import("../ai-connection-router.js").AiRuntimeConnectionBinding;
 };

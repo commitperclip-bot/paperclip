@@ -3,7 +3,7 @@ import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js
 import type { WorkspaceWorkers } from "../plugin-workspaces.js";
 import { createHeartbeatAgentStatus } from "./agent-status.js";
 import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace-restore-recovery.js";
-import { preserveCancelledNativeWorkspaces } from "../native-runtime/native-failed-workspace-recovery.js";
+import { preserveCancelledNativeWorkspaces, preserveOrphanedNativeWorkspace } from "../native-runtime/native-failed-workspace-recovery.js";
 import { nativeWorkspaceExportPendingForLease, pendingNativeWorkspaceFinalizationCondition } from "../native-runtime/native-workspace-finalization-state.js";
 import { CHAT_COMPLETION_WAKE_REASON } from "../chat-completion-delivery.js";
 import {
@@ -101,6 +101,7 @@ export interface HeartbeatRecoveryDependencies extends Pick<HeartbeatRetryDepend
   getRun: (runId: string, options?: Parameters<ReturnType<typeof createHeartbeatRunState>["getRun"]>[1]) => Promise<
     Awaited<ReturnType<ReturnType<typeof createHeartbeatRunState>["getRun"]>> | null
   >;
+  getRunWorkspaceSettlement: ReturnType<typeof createHeartbeatRunState>["getRunWorkspaceSettlement"];
   environmentRuntime: ReturnType<typeof environmentRuntimeService>;
   pluginWorkerManager?: WorkspaceWorkers;
   environmentsSvc: Pick<ReturnType<typeof environmentService>, "getById" | "getLeaseById" | "releaseLease">;
@@ -360,6 +361,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     environmentRuntime,
     scheduleNativeSessionResumeDispatch,
     getRun,
+    getRunWorkspaceSettlement,
     executeRun,
     activeRunExecutionPromises,
     cancelHeartbeatNativeRun,
@@ -957,6 +959,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     }
     const dispositions = await claimNativeRestartRecoveries({
       db,
+      liveRunExecutions: activeRunExecutions,
       restartKind,
       recoveryRequestId: intent?.recoveryRequestId ?? null,
       coordinatedPreviousController: intent
@@ -1483,6 +1486,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     let recovered = 0;
     for (const { lease } of rows) {
       if (await nativeWorkspaceExportPendingForLease(db, lease)) {
+        if (lease.heartbeatRunId && !activeRunExecutions.has(lease.heartbeatRunId)
+          && !adapterExecutionControls.has(lease.heartbeatRunId)
+          && await preserveOrphanedNativeWorkspace(db, lease)) recovered += 1;
         await deferOrphanedActiveLease(lease.id);
         continue;
       }
@@ -1858,7 +1864,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     agentId: string;
     succeeded: boolean;
   }) {
-    const settledRun = await getRun(input.runId);
+    const settledRun = await getRunWorkspaceSettlement(input.runId);
     const workspaceSyncReference = readNativeWorkspaceSyncReference(
       parseObject(settledRun?.runnerProfileJson).nativeWorkspaceSync,
     );

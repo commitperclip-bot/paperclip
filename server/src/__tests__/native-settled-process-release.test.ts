@@ -1,5 +1,6 @@
 import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+import { createDatabaseResponseCapture, installDatabaseResponseCapture } from "@paperclipai/db/response-capture";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import { and, eq } from "drizzle-orm";
@@ -206,6 +207,40 @@ suite("settled native run process identity", () => {
     expect(await releaseSettledNativeRunProcess(db, runId)).toBe("released");
     expect((await readRun(runId)).processPid).toBeNull();
   });
+
+  it("releases the stopped identity without reading saved execution payloads", async () => {
+    const { runId } = await seed();
+    const bulk = randomBytes(128 * 1024).toString("base64");
+    const before = await readRun(runId);
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...before.contextSnapshot, savedTask: bulk },
+      runnerProfileJson: { ...before.runnerProfileJson, sessionCheckpoint: { providerSessionId: "thread", savedState: bulk },
+        nativeExecutionInput: { task: bulk } }, resultJson: { savedResult: bulk }, stdoutExcerpt: bulk,
+    }).where(eq(heartbeatRuns.id, runId));
+    const saved = await readRun(runId);
+    const events: Array<Record<string, unknown>> = [];
+    const now = Date.now();
+    const capture = createDatabaseResponseCapture({ start: now - 100, end: now + 59_000 }, event => events.push(event));
+    installDatabaseResponseCapture(db, { heartbeatRuns }, capture);
+    try { expect(await releaseSettledNativeRunProcess(db, runId)).toBe("released"); }
+    finally { capture.flush(); }
+    const summary = events.find(event => event.event === "paperclip.db_response_capture.summary.v1")!;
+    expect(summary.responseValueBytes).toBeLessThan(8192);
+    const after = await readRun(runId);
+    expect(after).toEqual({ ...saved, processPid: null, processGroupId: null, processStartedAt: null,
+      nextEventSeq: saved.nextEventSeq + 1, updatedAt: after.updatedAt });
+    expect(await hasNativeLocalProcessStop(db, companyId, runId)).toBe(true);
+    expect(JSON.stringify(events)).not.toContain(bulk.slice(0, 64));
+  });
+
+  it.each([null, false, 0, "", {}, []].map(checkpoint => ({ checkpoint })))(
+    "preserves checkpoint presence semantics when releasing an identity ($checkpoint)", async ({ checkpoint }) => {
+      const { runId, pid } = await seed({ checkpoint: false });
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { sessionCheckpoint: checkpoint } })
+        .where(eq(heartbeatRuns.id, runId));
+      expect(await releaseSettledNativeRunProcess(db, runId)).toBe(checkpoint === null ? "skipped" : "released");
+      expect((await readRun(runId)).processPid).toBe(checkpoint === null ? pid : null);
+    },
+  );
 
   it("keeps the identity while the process is still alive, then releases it after exit", async () => {
     const child = startDetached();

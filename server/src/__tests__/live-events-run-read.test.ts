@@ -58,9 +58,19 @@ describe("live-event run read boundaries", () => {
     }).returning({ id: heartbeatRuns.id });
     const [maintenance] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, scopeKind: "company" }).returning({ id: heartbeatRuns.id });
     const [foreign] = await db.insert(heartbeatRuns).values({ companyId: foreignCompanyId, agentId: foreignAgent.id, scopeKind: "company" }).returning({ id: heartbeatRuns.id });
+    const hiddenIssueId = randomUUID();
+    await db.insert(issues).values({ id: hiddenIssueId, companyId, title: "Other private task", visibility: "private", privacyRootIssueId: hiddenIssueId, responsibleUserId: owner });
+    const [hiddenRun] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, scopeKind: "issue", issueId: hiddenIssueId }).returning({ id: heartbeatRuns.id });
     const reads: string[] = [];
+    const queries: string[] = [];
     let failNextRunRead = false;
+    let failNextIssueRead = false;
     const observedDb = drizzle(db.$client, { schema, logger: { logQuery(query) {
+      queries.push(query);
+      if (query.startsWith("select ") && query.includes('from "issues"') && failNextIssueRead) {
+        failNextIssueRead = false;
+        throw new Error("fixture issue lookup unavailable");
+      }
       if (query.startsWith("select ") && query.includes('from "heartbeat_runs"')) {
         reads.push(query);
         if (failNextRunRead) { failNextRunRead = false; throw new Error("fixture run lookup unavailable"); }
@@ -78,17 +88,32 @@ describe("live-event run read boundaries", () => {
     socket.on("message", bytes => messages.push(JSON.parse(bytes.toString())));
     try {
       await once(socket, "open");
-      async function deliver(runId: string) {
+      let deliveries = 0;
+      async function deliver(runId: string, payloadIssueId?: string) {
+        deliveries += 1;
         const start = messages.length;
         const barrier = randomUUID();
-        publishLiveEvent({ companyId, type: "heartbeat.run.status", payload: { runId, status: "running" } });
+        publishLiveEvent({ companyId, type: "heartbeat.run.status", payload: {
+          runId, status: "running", ...(payloadIssueId ? { issueId: payloadIssueId } : {}),
+        } });
         publishLiveEvent({ companyId, type: "agent.status", payload: { agentId: barrier, status: "idle" } });
         await expect.poll(() => messages.some(message => message.payload.agentId === barrier)).toBe(true);
         return messages.slice(start).filter(message => message.type === "heartbeat.run.status");
       }
 
       expect(await deliver(run.id)).toMatchObject([{ payload: { runId: run.id, status: "running" } }]);
+      const batchStart = queries.length;
+      expect(await deliver(run.id, issueId)).toMatchObject([{ payload: { runId: run.id, issueId, status: "running" } }]);
+      expect(queries.length - batchStart).toBeLessThanOrEqual(6);
+      expect(queries.slice(batchStart).filter(query => query.startsWith("select ") && query.includes('from "issues"')).length).toBeLessThanOrEqual(2);
+      expect(await deliver(hiddenRun.id, issueId)).toEqual([]);
+      expect(await deliver(run.id, hiddenIssueId)).toEqual([]);
+      expect(await deliver(run.id, randomUUID())).toEqual([]);
+      failNextIssueRead = true;
+      expect(await deliver(run.id, issueId)).toEqual([]);
+      expect(await deliver(run.id, issueId)).toHaveLength(1);
       await db.update(issueAccessGrants).set({ revokedAt: new Date() }).where(eq(issueAccessGrants.id, grant.id));
+      expect(await deliver(run.id, issueId)).toEqual([]);
       expect(await deliver(run.id)).toEqual([]);
       expect(await deliver(maintenance.id)).toHaveLength(1);
       expect(await deliver(foreign.id)).toEqual([]);
@@ -101,7 +126,7 @@ describe("live-event run read boundaries", () => {
       await db.delete(issues).where(eq(issues.id, issueId));
       expect(await deliver(run.id)).toEqual([]);
 
-      expect(reads).toHaveLength(9);
+      expect(reads).toHaveLength(deliveries);
       for (const query of reads) {
         expect(query).toMatch(/^select "company_id", "scope_kind", "issue_id" from "heartbeat_runs"/);
         expect(query).not.toMatch(/context_snapshot|runner_profile_json|stdout_excerpt|result_json/);

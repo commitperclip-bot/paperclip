@@ -38,6 +38,7 @@ export type {
   NativeExecutionInputV6,
   NativeExecutionInputV8,
   NativeExecutionInputV9,
+  NativeExecutionInputV10,
   MuseBindingSnapshot,
   DotBindingSnapshot,
   ExternalProviderPort,
@@ -107,6 +108,10 @@ export const PAPERCLIP_EXECUTION_PROMPT_REVISION =
   runner.PAPERCLIP_EXECUTION_PROMPT_REVISION;
 export const acpxRuntimeSessionDirectoryName =
   runner.acpxRuntimeSessionDirectoryName;
+export const OPENCODE_ISOLATED_HOMES_DIRECTORY =
+  runner.OPENCODE_ISOLATED_HOMES_DIRECTORY;
+export const opencodeRuntimeSessionDirectoryName =
+  runner.opencodeRuntimeSessionDirectoryName;
 export const canonicalNativeRuntimeContextDigest =
   runner.canonicalNativeRuntimeContextDigest;
 export const createNativeSessionBackend = runner.createNativeSessionBackend;
@@ -143,6 +148,7 @@ export const parsePaperclipQuestionResponse =
   runner.parsePaperclipQuestionResponse;
 export const resolveQualifiedAcpxProfile = runner.resolveQualifiedAcpxProfile;
 export const resolveClaudeEffort = runner.resolveClaudeEffort;
+export const resolveGrokEffort = runner.resolveGrokEffort;
 export const QUALIFIED_ACPX_PROFILES = runner.QUALIFIED_ACPX_PROFILES;
 export const QUALIFIED_ACPX_VERSION = runner.QUALIFIED_ACPX_VERSION;
 export const CURSOR_DISTRIBUTION_PINS = runner.CURSOR_DISTRIBUTION_PINS;
@@ -150,6 +156,7 @@ export const resolveSourceCodexHome = runner.resolveSourceCodexHome;
 export const resolveCodexCommand = runner.resolveCodexCommand;
 export const resolvePinnedCodexCommand = runner.resolvePinnedCodexCommand;
 export const validatePrpEvent = runner.validatePrpEvent;
+export const parseProviderPerformanceSpans = runner.parseProviderPerformanceSpans;
 export const validatePrpStructuredRunResult =
   runner.validatePrpStructuredRunResult;
 
@@ -162,6 +169,7 @@ export const completeTerminatedLocalNativeSessionCleanup = runner.completeTermin
 export const probeAcpxClaudeInstallation = runner.probeAcpxClaudeInstallation;
 export const probeAcpxGrokInstallation = runner.probeAcpxGrokInstallation;
 export const probeAcpxPiInstallation = runner.probeAcpxPiInstallation;
+export const PROVIDER_PACK_COMPATIBILITY = runner.PROVIDER_PACK_COMPATIBILITY;
 export const bundledRemoteProviderPackManifestPath = runner.bundledRemoteProviderPackManifestPath;
 export const bundledRemoteRunnerBinary = runner.bundledRemoteRunnerBinary;
 
@@ -173,3 +181,5 @@ export const configuredEnvironmentProjection = runner.configuredEnvironmentProje
 export const configuredEnvironment = runner.configuredEnvironment;
 
 export const probeNativeRunnerEnvironment = runner.probeNativeRunnerEnvironment;
+
+export const resolveGrokDisableWebSearch = runner.resolveGrokDisableWebSearch;
