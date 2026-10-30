@@ -315,11 +315,15 @@ export function statusCardService(
     }).where(eq(statusCards.id, card.id)).returning().then((rows) => rows[0]!);
     if (archiveChanged && input.archived && card.generatingIssueId) {
       const generationIssue = await db.select().from(issues).where(eq(issues.id, card.generatingIssueId)).then((rows) => rows[0] ?? null);
-      if (generationIssue && !TERMINAL_ISSUE_STATUSES.has(generationIssue.status)) {
-        await issuesSvc.update(generationIssue.id, { status: "cancelled" });
-      }
+      await cancelLiveGenerationIssue(generationIssue);
     }
     return next;
+  }
+
+  async function cancelLiveGenerationIssue(generationIssue: typeof issues.$inferSelect | null) {
+    if (!generationIssue || TERMINAL_ISSUE_STATUSES.has(generationIssue.status)) return false;
+    await issuesSvc.update(generationIssue.id, { status: "cancelled" });
+    return true;
   }
 
   async function remove(id: string) {
@@ -377,14 +381,16 @@ export function statusCardService(
     const summarizerAgentId = await resolveSummarizerAgentId(card);
 
     const hash = promptHash(card.interestPrompt);
-    if (card.generatingIssueId) {
-      const active = await db.select().from(issues).where(eq(issues.id, card.generatingIssueId)).then((rows) => rows[0] ?? null);
+    const active = card.generatingIssueId
+      ? await db.select().from(issues).where(eq(issues.id, card.generatingIssueId)).then((rows) => rows[0] ?? null)
+      : null;
+    if (active) {
       const payload = parseGenerationPayload(active?.description ?? null);
       // Only treat an existing setup task as "already generating" while it is
       // genuinely in flight. A `blocked` task is stuck awaiting a human and will
       // never finish on its own, so a manual re-kick must supersede it (reopened
       // to `todo` below) rather than silently no-op.
-      if (active && !TERMINAL_ISSUE_STATUSES.has(active.status) && active.status !== "blocked" && payload?.promptHash === hash) {
+      if (!TERMINAL_ISSUE_STATUSES.has(active.status) && active.status !== "blocked" && payload?.promptHash === hash) {
         return { card, generatingIssue: active, alreadyGenerating: true, displacedRunId: null };
       }
     }
@@ -419,14 +425,9 @@ export function statusCardService(
       .set({ generatingIssueId: generationIssue!.id, state: "compiling", failureReason: null, updatedAt: createdAt })
       .where(eq(statusCards.id, card.id))
       .returning();
-    let displacedRunId: string | null = null;
-    if (card.generatingIssueId && card.generatingIssueId !== generationIssue!.id) {
-      const displaced = await db.select().from(issues).where(eq(issues.id, card.generatingIssueId)).then((rows) => rows[0] ?? null);
-      if (displaced && !TERMINAL_ISSUE_STATUSES.has(displaced.status)) {
-        displacedRunId = displaced.executionRunId;
-        await issuesSvc.update(displaced.id, { status: "cancelled" });
-      }
-    }
+    const displacedRunId = active && active.id !== generationIssue!.id && await cancelLiveGenerationIssue(active)
+      ? active.executionRunId
+      : null;
     return {
       card: nextCard!,
       generatingIssue: generationIssue!,

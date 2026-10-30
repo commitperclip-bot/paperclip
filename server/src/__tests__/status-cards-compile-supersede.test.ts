@@ -7,6 +7,7 @@ import { agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai
 import { errorHandler } from "../middleware/index.js";
 import { statusCardRoutes } from "../routes/status-cards.js";
 import { withBuiltInAgentMarker } from "../lib/built-in-agent-metadata.js";
+import { heartbeatService } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
 import {
@@ -40,7 +41,7 @@ describeEmbeddedPostgres("status card compile supersede", () => {
       adapterConfig: { model: "gpt-5.4" },
       metadata: withBuiltInAgentMarker(null, { key: "summarizer", featureKeys: ["summarizer"] }),
     }).returning().then((rows) => rows[0]!);
-    const cancelledRunIds: string[] = [];
+    const heartbeat = heartbeatService(db);
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
@@ -50,10 +51,7 @@ describeEmbeddedPostgres("status card compile supersede", () => {
     app.use("/api", statusCardRoutes(db, {
       heartbeat: {
         wakeup: async () => ({ queued: true }),
-        cancelRun: async (runId: string) => {
-          cancelledRunIds.push(runId);
-          return null;
-        },
+        cancelRun: heartbeat.cancelRun,
       },
     }));
     app.use(errorHandler);
@@ -68,7 +66,7 @@ describeEmbeddedPostgres("status card compile supersede", () => {
     expect(patched.status).toBe(200);
     expect(patched.body).toMatchObject({ state: "compiling", failureReason: null });
     expect(patched.body.generatingIssueId).not.toBe(displacedIssueId);
-    expect(cancelledRunIds).toEqual([run.id]);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).then((rows) => rows[0]?.status)).toBe("cancelled");
     expect(await db.select().from(issues).where(eq(issues.id, displacedIssueId)).then((rows) => rows[0]?.status)).toBe("cancelled");
     expect(await db.select().from(issues).where(eq(issues.id, patched.body.generatingIssueId)).then((rows) => rows[0]?.status)).toBe("todo");
   });
