@@ -207,6 +207,26 @@ describePg("decisionService", () => {
     expect(states.find((row) => row.sourceId === unreviewedIssueId)?.archivedAt).toBeNull();
   });
 
+  it("keeps the proposed items when an archive proposal is dismissed", async () => {
+    const activityAt = new Date("2026-04-01T00:00:00.000Z");
+    await db.insert(decisionRetention).values({ companyId, sourceKind: "review", sourceId: targetIssueId, sourceActivityAt: activityAt });
+    const manifest: AttentionArchiveManifestEntry[] = [{ companyId, sourceKind: "review", sourceId: targetIssueId,
+      expectedVersion: 1, activityAt: activityAt.toISOString(), reason: "Archive" }];
+    const row = await service().create({ companyId, actor: agentActor(), agentId, runId, title: "Archive?", body: "Exact set",
+      options: [
+        { id: "archive", label: "Archive", style: "destructive", effects: [] },
+        { id: "keep", label: "Keep", effects: [] },
+      ],
+      metadata: { kind: "attention_archive_proposal", manifestHash: hashAttentionArchiveManifest(manifest) },
+      additionalTargetSnapshots: { [`attention:review:${targetIssueId}`]: { status: "attention", assigneeAgentId: null,
+        assigneeUserId: null, updatedAt: activityAt.toISOString(), attentionArchive: manifest[0] } } });
+    const result = await service().dismiss(row.id, decidedByUserId, boardActor(), "Not now");
+    expect(result).toMatchObject({ chosenOptionId: "keep", executionStatus: "succeeded" });
+    const [state] = await db.select().from(decisionRetention).where(eq(decisionRetention.sourceId, targetIssueId));
+    expect(state.archivedAt).toBeNull();
+    expect(state.archiveVersion).toBe(0);
+  });
+
   it.each(["invalid_signature", "manifest_mismatch", "archive_failure"] as const)("delivers a recovered archive failure without inherited pending metadata: %s", async failure => {
     const activityAt = new Date("2026-04-01T00:00:00.000Z");
     const manifest: AttentionArchiveManifestEntry[] = [{ companyId, sourceKind: "review", sourceId: targetIssueId,
