@@ -150,7 +150,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     [false, []],
   ])("offers the connections MCP server only to task-bound runs (task bound: %s)", async (taskBound, expected) => {
     const { input, adapter } = await fixture();
-    vi.mocked(createAdapterRuntimeToolAccess).mockReturnValue({ mcpEndpoint: "http://localhost/mcp/runtime-tools", bearerToken: "token" } as ReturnType<typeof createAdapterRuntimeToolAccess>);
+    vi.mocked(createAdapterRuntimeToolAccess).mockReturnValueOnce({ mcpEndpoint: "http://localhost/mcp/runtime-tools", bearerToken: "token" } as ReturnType<typeof createAdapterRuntimeToolAccess>);
     input.runtime.adapter.runtimeToolDelivery = "native_mcp";
     if (!taskBound) input.task = { ...input.task, issueRef: null, issueId: null };
     let names: string[] = [];
